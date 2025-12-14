@@ -100,7 +100,9 @@
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src --ext ts",
     "test": "node ./out/test/runTest.js",
-    "postinstall": "patch-package"
+    "postinstall": "patch-package",
+    "website:dev": "npm run dev --prefix docs/website",
+    "website:build": "npm run build --prefix docs/website"
   },
   "devDependencies": {
     "@types/mime-types": "^2.1.4",

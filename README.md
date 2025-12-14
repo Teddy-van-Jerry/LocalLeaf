@@ -4,6 +4,10 @@
 
 # LocalLeaf: Local LaTeX Editing yet Synced to Overleaf
 
+[![VS Code Marketplace](https://img.shields.io/visual-studio-marketplace/v/teddy-van-jerry.localleaf?label=VS%20Code%20Marketplace)](https://marketplace.visualstudio.com/items?itemName=teddy-van-jerry.localleaf)
+[![Website](https://img.shields.io/badge/Website-localleaf.wqzhao.org-green)](https://localleaf.wqzhao.org)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A VS Code extension for a workaround solution to collaborate on LaTeX documents using [Overleaf](https://www.overleaf.com/) while editing them locally.
 
 ## Features
@@ -16,7 +20,7 @@ A VS Code extension for a workaround solution to collaborate on LaTeX documents 
 
 ## Getting Started
 
-1. Install the extension
+1. Install the extension from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=teddy-van-jerry.localleaf)
 2. Run `LocalLeaf: Login` command and enter your Overleaf cookies (see [how to get cookies](https://github.com/overleaf-workshop/Overleaf-Workshop/blob/master/docs/wiki.md#login-with-cookies))
 3. Open a folder and run `LocalLeaf: Link Folder to Overleaf Project`
 4. Start editing - changes sync automatically!

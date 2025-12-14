@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LocalLeaf Logo - Original Minecraft-style pixelated leaf growing from local ground -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" shape-rendering="crispEdges">
+  <!-- Ground at bottom (40px) -->
+  <!-- Grass layer -->
+  <rect x="0" y="88" width="128" height="8" fill="#5B9A2C"/>
+  <rect x="16" y="88" width="8" height="8" fill="#4A7C23"/>
+  <rect x="48" y="88" width="8" height="8" fill="#3D6B1E"/>
+  <rect x="80" y="88" width="8" height="8" fill="#4A7C23"/>
+  <rect x="112" y="88" width="8" height="8" fill="#3D6B1E"/>
+
+  <!-- Dirt layers -->
+  <rect x="0" y="96" width="128" height="32" fill="#6B4226"/>
+  <rect x="8" y="96" width="8" height="8" fill="#8B5A2B"/>
+  <rect x="40" y="96" width="8" height="8" fill="#5D3A1A"/>
+  <rect x="72" y="96" width="8" height="8" fill="#8B5A2B"/>
+  <rect x="104" y="96" width="8" height="8" fill="#5D3A1A"/>
+  <rect x="24" y="104" width="8" height="8" fill="#5D3A1A"/>
+  <rect x="56" y="104" width="8" height="8" fill="#8B5A2B"/>
+  <rect x="88" y="104" width="8" height="8" fill="#5D3A1A"/>
+  <rect x="120" y="104" width="8" height="8" fill="#8B5A2B"/>
+  <rect x="0" y="112" width="8" height="8" fill="#8B5A2B"/>
+  <rect x="32" y="112" width="8" height="8" fill="#5D3A1A"/>
+  <rect x="64" y="112" width="8" height="8" fill="#8B5A2B"/>
+  <rect x="96" y="112" width="8" height="8" fill="#5D3A1A"/>
+  <rect x="16" y="120" width="8" height="8" fill="#5D3A1A"/>
+  <rect x="48" y="120" width="8" height="8" fill="#8B5A2B"/>
+  <rect x="80" y="120" width="8" height="8" fill="#5D3A1A"/>
+  <rect x="112" y="120" width="8" height="8" fill="#8B5A2B"/>
+
+  <!-- Stem (brown, growing from ground) -->
+  <rect x="60" y="64" width="8" height="8" fill="#5D4037"/>
+  <rect x="60" y="72" width="8" height="8" fill="#4E342E"/>
+  <rect x="60" y="80" width="8" height="8" fill="#3E2723"/>
+  <rect x="60" y="88" width="8" height="8" fill="#3E2723"/>
+
+  <!-- Original simple leaf design - pointed oval shape -->
+  <!-- Top point -->
+  <rect x="60" y="8" width="8" height="8" fill="#66BB6A"/>
+
+  <!-- Row 2 -->
+  <rect x="52" y="16" width="8" height="8" fill="#4CAF50"/>
+  <rect x="60" y="16" width="8" height="8" fill="#81C784"/>
+  <rect x="68" y="16" width="8" height="8" fill="#4CAF50"/>
+
+  <!-- Row 3 -->
+  <rect x="44" y="24" width="8" height="8" fill="#43A047"/>
+  <rect x="52" y="24" width="8" height="8" fill="#66BB6A"/>
+  <rect x="60" y="24" width="8" height="8" fill="#A5D6A7"/>
+  <rect x="68" y="24" width="8" height="8" fill="#66BB6A"/>
+  <rect x="76" y="24" width="8" height="8" fill="#43A047"/>
+
+  <!-- Row 4 - widest -->
+  <rect x="36" y="32" width="8" height="8" fill="#388E3C"/>
+  <rect x="44" y="32" width="8" height="8" fill="#4CAF50"/>
+  <rect x="52" y="32" width="8" height="8" fill="#81C784"/>
+  <rect x="60" y="32" width="8" height="8" fill="#2E7D32"/>
+  <rect x="68" y="32" width="8" height="8" fill="#81C784"/>
+  <rect x="76" y="32" width="8" height="8" fill="#4CAF50"/>
+  <rect x="84" y="32" width="8" height="8" fill="#388E3C"/>
+
+  <!-- Row 5 -->
+  <rect x="36" y="40" width="8" height="8" fill="#43A047"/>
+  <rect x="44" y="40" width="8" height="8" fill="#66BB6A"/>
+  <rect x="52" y="40" width="8" height="8" fill="#4CAF50"/>
+  <rect x="60" y="40" width="8" height="8" fill="#2E7D32"/>
+  <rect x="68" y="40" width="8" height="8" fill="#4CAF50"/>
+  <rect x="76" y="40" width="8" height="8" fill="#66BB6A"/>
+  <rect x="84" y="40" width="8" height="8" fill="#43A047"/>
+
+  <!-- Row 6 -->
+  <rect x="44" y="48" width="8" height="8" fill="#4CAF50"/>
+  <rect x="52" y="48" width="8" height="8" fill="#66BB6A"/>
+  <rect x="60" y="48" width="8" height="8" fill="#2E7D32"/>
+  <rect x="68" y="48" width="8" height="8" fill="#66BB6A"/>
+  <rect x="76" y="48" width="8" height="8" fill="#4CAF50"/>
+
+  <!-- Row 7 -->
+  <rect x="52" y="56" width="8" height="8" fill="#43A047"/>
+  <rect x="60" y="56" width="8" height="8" fill="#2E7D32"/>
+  <rect x="68" y="56" width="8" height="8" fill="#43A047"/>
+
+  <!-- Bottom point connects to stem -->
+  <rect x="60" y="64" width="8" height="8" fill="#33691E"/>
+</svg>

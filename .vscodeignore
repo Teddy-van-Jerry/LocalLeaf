@@ -1,5 +1,7 @@
 .vscode/**
 .vscode-test/**
+.github/**
+docs/**
 src/**
 patches/**
 images/*.svg
