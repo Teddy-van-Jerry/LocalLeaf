@@ -25,6 +25,10 @@ A VS Code extension for a workaround solution to collaborate on LaTeX documents 
 3. Open a folder and run `LocalLeaf: Link Folder to Overleaf Project`
 4. Start editing - changes sync automatically!
 
+> [!WARNING]
+> - Only paste cookies when the server URL is the real Overleaf host (`https://www.overleaf.com`). The extension sends the cookie to whatever URL you enter; avoid lookalike URLs such as `https://www.overleaf.com.attacker.test` or ones that hide another host (e.g., `https://www.overleaf.com@evil.com`).
+> - Cookies are stored in VS Code Secret Storage, not in your workspace, but they still grant full account access. Treat them like a password and clear credentials with `LocalLeaf: Logout` if you suspect exposure.
+
 ## Commands
 
 | Command | Description |
