@@ -1,0 +1,125 @@
+{
+  "name": "localleaf",
+  "displayName": "LocalLeaf",
+  "description": "Local sync for Overleaf LaTeX projects",
+  "version": "0.1.0",
+  "publisher": "teddy-van-jerry",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Teddy-van-Jerry/LocalLeaf"
+  },
+  "license": "MIT",
+  "icon": "images/icon.png",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "latex",
+    "overleaf",
+    "sync",
+    "tex"
+  ],
+  "activationEvents": [
+    "*"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "localleaf.login",
+        "title": "LocalLeaf: Login"
+      },
+      {
+        "command": "localleaf.logout",
+        "title": "LocalLeaf: Logout"
+      },
+      {
+        "command": "localleaf.linkFolder",
+        "title": "LocalLeaf: Link Folder to Overleaf Project"
+      },
+      {
+        "command": "localleaf.unlinkFolder",
+        "title": "LocalLeaf: Unlink Folder"
+      },
+      {
+        "command": "localleaf.syncNow",
+        "title": "LocalLeaf: Sync Now"
+      },
+      {
+        "command": "localleaf.pullFromOverleaf",
+        "title": "LocalLeaf: Pull from Overleaf"
+      },
+      {
+        "command": "localleaf.pushToOverleaf",
+        "title": "LocalLeaf: Push to Overleaf"
+      },
+      {
+        "command": "localleaf.editIgnorePatterns",
+        "title": "LocalLeaf: Edit Ignore Patterns"
+      },
+      {
+        "command": "localleaf.showSyncStatus",
+        "title": "LocalLeaf: Show Sync Status"
+      },
+      {
+        "command": "localleaf.setMainDocument",
+        "title": "LocalLeaf: Set Main Document"
+      },
+      {
+        "command": "localleaf.configure",
+        "title": "LocalLeaf: Configure Settings"
+      },
+      {
+        "command": "localleaf.jumpToCollaborator",
+        "title": "LocalLeaf: Jump to Collaborator"
+      }
+    ],
+    "configuration": {
+      "title": "LocalLeaf",
+      "properties": {
+        "localleaf.defaultServer": {
+          "type": "string",
+          "default": "https://www.overleaf.com",
+          "description": "Default Overleaf server URL"
+        },
+        "localleaf.autoSync": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable automatic sync when files change"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src --ext ts",
+    "test": "node ./out/test/runTest.js",
+    "postinstall": "patch-package"
+  },
+  "devDependencies": {
+    "@types/mime-types": "^2.1.4",
+    "@types/minimatch": "^5.1.2",
+    "@types/node": "^20.10.0",
+    "patch-package": "^8.0.0",
+    "@types/node-fetch": "^2.6.9",
+    "@types/socket.io-client": "^1.4.36",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^6.13.0",
+    "@typescript-eslint/parser": "^6.13.0",
+    "eslint": "^8.55.0",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "form-data": "^4.0.0",
+    "mime-types": "^2.1.35",
+    "minimatch": "^9.0.3",
+    "node-fetch": "^2.7.0",
+    "socket.io-client": "github:overleaf/socket.io-client#0.9.17-overleaf-5"
+  }
+}
