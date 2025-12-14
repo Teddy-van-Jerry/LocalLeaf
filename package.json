@@ -1,7 +1,7 @@
 {
   "name": "localleaf",
   "displayName": "LocalLeaf",
-  "description": "Local sync for Overleaf LaTeX projects",
+  "description": "Local LaTeX Editing yet Synced to Overleaf",
   "version": "0.1.0",
   "publisher": "teddy-van-jerry",
   "repository": {
@@ -23,7 +23,7 @@
     "tex"
   ],
   "activationEvents": [
-    "*"
+    "workspaceContains:.localleaf"
   ],
   "main": "./out/extension.js",
   "contributes": {

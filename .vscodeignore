@@ -1,0 +1,13 @@
+.vscode/**
+.vscode-test/**
+src/**
+patches/**
+images/*.svg
+.gitignore
+.vscodeignore
+tsconfig.json
+**/*.ts
+!out/**/*.js
+**/*.map
+*.vsix
+CLAUDE.local.md
