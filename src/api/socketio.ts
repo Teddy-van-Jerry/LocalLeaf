@@ -14,7 +14,6 @@ let outputChannel: vscode.OutputChannel | undefined;
 function log(message: string) {
     const timestamp = new Date().toISOString().split('T')[1].split('.')[0];
     const logMessage = `[${timestamp}] ${message}`;
-    console.log('[LocalLeaf]', message);
     if (outputChannel) {
         outputChannel.appendLine(logMessage);
     }
@@ -93,8 +92,6 @@ export interface SocketEventHandlers {
     onCompilerUpdated?: (compiler: string) => void;
 }
 
-type ConnectionScheme = 'v1' | 'v2';
-
 /**
  * Socket.io API for real-time communication with Overleaf
  * Reference: Overleaf-Workshop/src/api/socketio.ts
@@ -110,7 +107,6 @@ export class SocketIOAPI {
     private _handshakeComplete: boolean = false;
     private _handshakePromise!: Promise<void>;
     private _handshakeResolve!: () => void;
-    private scheme: ConnectionScheme = 'v1';
 
     constructor(
         private readonly api: BaseAPI,
@@ -125,53 +121,19 @@ export class SocketIOAPI {
      * Reference: Overleaf-Workshop socketio.ts init()
      */
     private init() {
-        log(`Initializing socket with scheme: ${this.scheme}`);
-
         // Create handshake promise
         this._handshakeComplete = false;
         this._handshakePromise = new Promise((resolve) => {
             this._handshakeResolve = resolve;
         });
 
-        switch (this.scheme) {
-            case 'v1':
-                // v1: Connect without query parameters
-                this.projectRecordPromise = undefined;
-                this.socket = this.api.initSocket(this.identity);
-                log('Socket created (v1 scheme, no query params)');
-                break;
-            case 'v2':
-                // v2: Connect with projectId and timestamp in query
-                this.projectRecordPromise = undefined;
-                const query = `?projectId=${this.projectId}&t=${Date.now()}`;
-                this.socket = this.api.initSocket(this.identity, query);
-                log(`Socket created (v2 scheme, query: ${query})`);
-                break;
-        }
+        // Connect with projectId and timestamp in query
+        this.projectRecordPromise = undefined;
+        const query = `?projectId=${this.projectId}&t=${Date.now()}`;
+        this.socket = this.api.initSocket(this.identity, query);
 
         this.setupEmit();
         this.setupInternalHandlers();
-    }
-
-    /**
-     * Reinitialize with different scheme
-     */
-    private reinit(newScheme: ConnectionScheme) {
-        log(`Switching from ${this.scheme} to ${newScheme} scheme`);
-        if (this.socket) {
-            try {
-                this.socket.disconnect();
-            } catch (e) {
-                // Ignore disconnect errors
-            }
-        }
-        this.scheme = newScheme;
-        this.init();
-
-        // Re-register handlers
-        const existingHandlers = [...this.handlers];
-        this.handlers = [];
-        existingHandlers.forEach(h => this.registerHandlers(h));
     }
 
     /**
@@ -182,18 +144,14 @@ export class SocketIOAPI {
         (this.socket.emit)[promisify.custom] = (event: string, ...args: any[]) => {
             const timeoutPromise = new Promise<any[]>((_, reject) => {
                 setTimeout(() => {
-                    log(`Emit timeout for event: ${event}`);
                     reject(new Error('Socket emit timeout'));
                 }, 5000);
             });
             const waitPromise = new Promise<any[]>((resolve, reject) => {
-                log(`Emitting event: ${event}`);
                 this.socket.emit(event, ...args, (err: any, ...data: any[]) => {
                     if (err) {
-                        log(`Emit error for ${event}: ${err}`);
                         reject(new Error(err));
                     } else {
-                        log(`Emit success for ${event}`);
                         resolve(data);
                     }
                 });
@@ -209,59 +167,54 @@ export class SocketIOAPI {
      */
     private setupInternalHandlers() {
         this.socket.on('connect', () => {
-            log('Socket event: connect (handshake complete)');
             this._connected = true;
             this._handshakeComplete = true;
             this._handshakeResolve();
         });
 
         this.socket.on('connect_failed', () => {
-            log('Socket event: connect_failed');
+            log('Connection failed');
             this._connected = false;
         });
 
         this.socket.on('forceDisconnect', (message: string, delay: number = 10) => {
-            log(`Socket event: forceDisconnect - ${message}`);
+            log(`Force disconnected: ${message}`);
             this._connected = false;
         });
 
         this.socket.on('error', (err: any) => {
-            log(`Socket event: error - ${err}`);
+            log(`Socket error: ${err}`);
         });
 
         this.socket.on('disconnect', () => {
-            log('Socket event: disconnect');
+            log('Disconnected from Overleaf');
             this._connected = false;
             this.handlers.forEach(h => h.onDisconnected?.());
         });
 
         this.socket.on('connectionRejected', (err: any) => {
-            log(`Socket event: connectionRejected - ${err?.message}`);
+            log(`Connection rejected: ${err?.message}`);
             this._connected = false;
         });
 
         this.socket.on('connectionAccepted', (_: any, publicId: string) => {
-            log(`Socket event: connectionAccepted - publicId: ${publicId}`);
             this._publicId = publicId;
             this._connected = true;
             this.handlers.forEach(h => h.onConnected?.(publicId));
         });
 
-        // v2 scheme handler - joinProjectResponse
-        if (this.scheme === 'v2') {
-            this.projectRecordPromise = new Promise((resolve) => {
-                this.socket.on('joinProjectResponse', (res: any) => {
-                    log('Socket event: joinProjectResponse received');
-                    const publicId = res.publicId as string;
-                    const project = res.project as ProjectEntity;
-                    this._publicId = publicId;
-                    this._connected = true;
-                    this.projectRecord = project;
-                    this.handlers.forEach(h => h.onConnected?.(publicId));
-                    resolve(project);
-                });
+        // joinProjectResponse handler
+        this.projectRecordPromise = new Promise((resolve) => {
+            this.socket.on('joinProjectResponse', (res: any) => {
+                const publicId = res.publicId as string;
+                const project = res.project as ProjectEntity;
+                this._publicId = publicId;
+                this._connected = true;
+                this.projectRecord = project;
+                this.handlers.forEach(h => h.onConnected?.(publicId));
+                resolve(project);
             });
-        }
+        });
     }
 
     /**
@@ -342,16 +295,13 @@ export class SocketIOAPI {
             return;
         }
 
-        log('Waiting for socket handshake...');
         const timeoutPromise = new Promise<void>((_, reject) => {
             setTimeout(() => {
-                log('Handshake timeout');
                 reject(new Error('Socket handshake timeout'));
             }, timeoutMs);
         });
 
         await Promise.race([this._handshakePromise, timeoutPromise]);
-        log('Handshake complete, ready to emit');
     }
 
     /**
@@ -359,86 +309,33 @@ export class SocketIOAPI {
      * Reference: Overleaf-Workshop socketio.ts joinProject()
      */
     async joinProject(): Promise<ProjectEntity> {
-        log(`Joining project: ${this.projectId} (scheme: ${this.scheme})`);
-
         // Wait for handshake before emitting
-        try {
-            await this.waitForHandshake();
-        } catch (error) {
-            // Handshake timeout - try v2 scheme
-            if (this.scheme === 'v1') {
-                log('Handshake failed in v1, switching to v2 scheme');
-                this.reinit('v2');
-                return this.joinProject();
-            }
-            throw error;
-        }
+        await this.waitForHandshake();
 
         const timeoutPromise = new Promise<never>((_, reject) => {
             setTimeout(() => {
-                log('Join project timeout');
                 reject(new Error('Join project timeout'));
             }, 5000);
         });
 
-        switch (this.scheme) {
-            case 'v1': {
-                const joinPromise = this.emit('joinProject', { project_id: this.projectId })
-                    .then((returns: any) => {
-                        const [project, permissionsLevel, protocolVersion] = returns as [ProjectEntity, string, number];
-                        log(`Joined project successfully (permissions: ${permissionsLevel}, protocol: ${protocolVersion})`);
-                        this.projectRecord = project;
-                        this._connected = true;
-                        return project;
-                    });
-
-                // Listen for connection rejection and switch to v2
-                const rejectPromise = new Promise<never>((_, reject) => {
-                    this.socket.on('connectionRejected', (err: any) => {
-                        log(`Connection rejected in v1, will try v2: ${err?.message}`);
-                        reject(new Error(err?.message || 'Connection rejected'));
-                    });
-                });
-
-                try {
-                    return await Promise.race([joinPromise, rejectPromise, timeoutPromise]);
-                } catch (error: any) {
-                    // If rejected or timed out, try v2 scheme
-                    if (this.scheme === 'v1') {
-                        log('v1 failed, switching to v2 scheme');
-                        this.reinit('v2');
-                        return this.joinProject(); // Retry with v2
-                    }
-                    throw error;
-                }
-            }
-
-            case 'v2': {
-                // v2 uses joinProjectResponse event instead of callback
-                if (this.projectRecordPromise) {
-                    try {
-                        return await Promise.race([this.projectRecordPromise, timeoutPromise]);
-                    } catch (error) {
-                        log(`v2 scheme also failed: ${error}`);
-                        throw error;
-                    }
-                }
-                throw new Error('v2 scheme not properly initialized');
-            }
+        // v2 uses joinProjectResponse event instead of callback
+        if (this.projectRecordPromise) {
+            const project = await Promise.race([this.projectRecordPromise, timeoutPromise]);
+            log(`Connected to project (real-time)`);
+            return project;
         }
+        throw new Error('Socket not properly initialized');
     }
 
     /**
      * Join a document for editing
      */
     async joinDoc(docId: string): Promise<{ lines: string[]; version: number }> {
-        log(`Joining doc: ${docId}`);
         const [docLinesAscii, version, _updates, _ranges] = await this.emit('joinDoc', docId, {
             encodeRanges: true,
         }) as [string[], number, any[], any];
 
         const lines = docLinesAscii.map(line => Buffer.from(line, 'ascii').toString('utf-8'));
-        log(`Joined doc successfully (version: ${version}, lines: ${lines.length})`);
         return { lines, version };
     }
 
@@ -446,7 +343,6 @@ export class SocketIOAPI {
      * Leave a document
      */
     async leaveDoc(docId: string): Promise<void> {
-        log(`Leaving doc: ${docId}`);
         await this.emit('leaveDoc', docId);
     }
 
@@ -454,7 +350,6 @@ export class SocketIOAPI {
      * Apply OT update to a document
      */
     async applyOtUpdate(docId: string, update: DocumentUpdate): Promise<void> {
-        log(`Applying OT update to doc: ${docId}`);
         await this.emit('applyOtUpdate', docId, update);
     }
 
@@ -462,7 +357,6 @@ export class SocketIOAPI {
      * Get connected users
      */
     async getConnectedUsers(): Promise<OnlineUser[]> {
-        log('Getting connected users');
         const [users] = await this.emit('clientTracking.getConnectedUsers') as [Array<{
             client_id: string;
             user_id: string;
@@ -517,7 +411,6 @@ export class SocketIOAPI {
      * Disconnect from socket
      */
     disconnect() {
-        log('Disconnecting socket');
         this.socket.disconnect();
         this._connected = false;
     }
@@ -527,7 +420,7 @@ export class SocketIOAPI {
      */
     reconnect() {
         if (!this._connected) {
-            log('Reconnecting socket');
+            log('Reconnecting...');
             this.init();
         }
     }

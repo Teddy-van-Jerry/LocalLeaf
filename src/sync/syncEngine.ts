@@ -48,6 +48,46 @@ function hashContent(content: Uint8Array | undefined): number {
 }
 
 /**
+ * Check if an error is a FileNotFound error (race condition safe)
+ * This handles the case where a file is deleted between the watcher event and the read
+ */
+function isFileNotFoundError(error: unknown): boolean {
+    if (error instanceof vscode.FileSystemError) {
+        // VS Code FileSystemError has a 'code' property
+        return error.code === 'FileNotFound' || error.code === 'EntryNotFound';
+    }
+    // Also check error message as fallback
+    if (error instanceof Error) {
+        const msg = error.message.toLowerCase();
+        return msg.includes('entrynotfound') || msg.includes('filenotfound') || msg.includes('enoent');
+    }
+    return false;
+}
+
+/**
+ * Compare two Uint8Arrays for equality
+ */
+function contentEquals(a: Uint8Array | undefined, b: Uint8Array | undefined): boolean {
+    if (a === b) return true;
+    if (!a || !b) return false;
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+        if (a[i] !== b[i]) return false;
+    }
+    return true;
+}
+
+/**
+ * Debug logging - only logs in debug mode
+ */
+const DEBUG = false;
+function debugLog(...args: unknown[]): void {
+    if (DEBUG) {
+        console.log('[LocalLeaf]', ...args);
+    }
+}
+
+/**
  * File entry in the project tree
  */
 interface FileTreeEntry {
@@ -74,15 +114,23 @@ export class SyncEngine {
     private _onStatusChange = new vscode.EventEmitter<SyncStatusEvent>();
     private disposables: vscode.Disposable[] = [];
     private syncLock: Set<string> = new Set();
+    private joinedDocs: Set<string> = new Set();
+    private logFn?: (message: string) => void;
 
     readonly onStatusChange = this._onStatusChange.event;
 
     constructor(
         private readonly api: BaseAPI,
-        private readonly settings: SettingsManager
+        private readonly settings: SettingsManager,
+        logFn?: (message: string) => void
     ) {
         const workspaceFolder = settings.getWorkspaceFolder();
         this.ignoreParser = new IgnoreParser(workspaceFolder, settings.getSettings());
+        this.logFn = logFn;
+    }
+
+    private log(message: string): void {
+        this.logFn?.(message);
     }
 
     /**
@@ -141,7 +189,7 @@ export class SyncEngine {
             this.buildFileTree(this.project);
             this.setStatus('idle', 'Connected (real-time)');
         } catch (error) {
-            console.log('[LocalLeaf] Socket.io failed, using HTTP fallback:', error);
+            debugLog('Socket.io failed, using HTTP fallback:', error);
             useHttpFallback = true;
         }
 
@@ -158,7 +206,7 @@ export class SyncEngine {
                 }
 
                 const projectData = projectResult.projectData;
-                console.log('[LocalLeaf] HTTP fallback - project data:', projectData.projectName);
+                debugLog('HTTP fallback - project data:', projectData.projectName);
 
                 // Build file tree from rootFolder if available
                 if (projectData.rootFolder && projectData.rootFolder.length > 0) {
@@ -176,6 +224,16 @@ export class SyncEngine {
                     // Fallback: get entities list and build minimal tree
                     const entitiesResult = await this.api.getProjectEntities(projectSettings.projectId);
                     if (entitiesResult.type === 'success' && entitiesResult.entities) {
+                        // Create minimal project object for HTTP-only mode
+                        this.project = {
+                            _id: projectSettings.projectId,
+                            name: projectSettings.projectName || 'Unknown',
+                            rootDoc_id: undefined,
+                            rootFolder: [],
+                            compiler: 'pdflatex',
+                            owner: { _id: '', email: '', first_name: 'Unknown' },
+                            members: [],
+                        };
                         this.buildFileTreeFromEntities(entitiesResult.entities);
                     }
                 }
@@ -223,8 +281,8 @@ export class SyncEngine {
      * Build file tree from project structure
      */
     private buildFileTree(project: ProjectEntity): void {
-        console.log('[LocalLeaf] buildFileTree: Building tree for project', project.name);
-        console.log('[LocalLeaf] buildFileTree: rootFolder count:', project.rootFolder?.length || 0);
+        debugLog('buildFileTree: Building tree for project', project.name);
+        debugLog('buildFileTree: rootFolder count:', project.rootFolder?.length || 0);
 
         this.fileTree.clear();
         this.fileTreeByPath.clear();
@@ -269,7 +327,7 @@ export class SyncEngine {
                 };
                 this.fileTree.set(doc._id, entry);
                 this.fileTreeByPath.set(docPath, entry);
-                console.log('[LocalLeaf] buildFileTree: Added doc', docPath);
+                debugLog('buildFileTree: Added doc', docPath);
             }
 
             // Add file refs
@@ -284,7 +342,7 @@ export class SyncEngine {
                 };
                 this.fileTree.set(file._id, entry);
                 this.fileTreeByPath.set(filePath, entry);
-                console.log('[LocalLeaf] buildFileTree: Added file', filePath);
+                debugLog('buildFileTree: Added file', filePath);
             }
 
             // Recurse into subfolders
@@ -298,7 +356,29 @@ export class SyncEngine {
             traverse(project.rootFolder[0], '', undefined, true);
         }
 
-        console.log('[LocalLeaf] buildFileTree: Total entries:', this.fileTree.size);
+        debugLog('buildFileTree: Total entries:', this.fileTree.size);
+    }
+
+    /**
+     * Detect and update main document from project's rootDoc_id
+     */
+    async detectMainDocument(): Promise<void> {
+        if (!this.project?.rootDoc_id) return;
+
+        const rootDocEntry = this.fileTree.get(this.project.rootDoc_id);
+        if (!rootDocEntry || rootDocEntry.type !== 'doc') return;
+
+        const mainTex = rootDocEntry.path.startsWith('/')
+            ? rootDocEntry.path.slice(1)  // Remove leading slash
+            : rootDocEntry.path;
+        const mainPdf = mainTex.replace(/\.tex$/, '.pdf');
+
+        const currentSettings = this.settings.getSettings();
+        if (currentSettings && (currentSettings.mainTex !== mainTex || currentSettings.mainPdf !== mainPdf)) {
+            await this.settings.update({ mainTex, mainPdf });
+            this.ignoreParser.updateSettings({ ...currentSettings, mainTex, mainPdf });
+            debugLog('Updated main document:', mainTex, mainPdf);
+        }
     }
 
     /**
@@ -386,12 +466,24 @@ export class SyncEngine {
         if (!this.acquireLock(relativePath)) return;
 
         try {
-            const content = await vscode.workspace.fs.readFile(uri);
+            // Read file content - may throw if file was deleted between watcher event and now
+            let content: Uint8Array;
+            try {
+                content = await vscode.workspace.fs.readFile(uri);
+            } catch (readError) {
+                // File was deleted between watcher event and read - this is normal during rapid operations
+                if (isFileNotFoundError(readError)) {
+                    debugLog(`File no longer exists (race condition): ${relativePath}`);
+                    return;
+                }
+                throw readError;
+            }
+
             if (!this.shouldPropagate('push', relativePath, content)) return;
 
             const entry = this.fileTreeByPath.get(relativePath);
             if (!entry) {
-                console.log(`[LocalLeaf] File not in remote tree: ${relativePath}`);
+                debugLog(`File not in remote tree: ${relativePath}`);
                 return;
             }
 
@@ -400,7 +492,10 @@ export class SyncEngine {
             // For documents, we need to use OT updates
             // For binary files, we upload directly
             if (entry.type === 'doc' && this.socket) {
-                await this.pushDocumentChanges(entry.id, relativePath, content);
+                const pushed = await this.pushDocumentChanges(entry.id, relativePath, content);
+                if (pushed) {
+                    this.log(`Pushed to Overleaf: ${relativePath}`);
+                }
             } else {
                 // Upload binary file
                 const projectSettings = this.settings.getSettings()!;
@@ -410,11 +505,18 @@ export class SyncEngine {
                     entry.name,
                     content
                 );
+                this.log(`Uploaded to Overleaf: ${relativePath}`);
             }
 
             this.baseContent.set(relativePath, content);
             this.setStatus('idle');
         } catch (error) {
+            // Don't show error for file-not-found during rapid operations
+            if (isFileNotFoundError(error)) {
+                debugLog(`File disappeared during sync: ${relativePath}`);
+                this.setStatus('idle');
+                return;
+            }
             console.error(`[LocalLeaf] Failed to sync ${relativePath}:`, error);
             this.setStatus('error', `Failed to sync: ${error}`);
         } finally {
@@ -424,12 +526,13 @@ export class SyncEngine {
 
     /**
      * Push document changes using OT
+     * Returns true if changes were actually pushed
      */
-    private async pushDocumentChanges(docId: string, path: string, newContent: Uint8Array): Promise<void> {
-        if (!this.socket) return;
+    private async pushDocumentChanges(docId: string, path: string, newContent: Uint8Array): Promise<boolean> {
+        if (!this.socket) return false;
 
         try {
-            // Join document
+            // Join document to get current version (even if already joined for watching)
             const { lines: remoteLines, version } = await this.socket.joinDoc(docId);
             const remoteContent = remoteLines.join('\n');
             const localContent = new TextDecoder().decode(newContent);
@@ -444,10 +547,15 @@ export class SyncEngine {
                     v: version,
                 };
                 await this.socket.applyOtUpdate(docId, update);
+
+                // Keep doc joined for watching
+                this.joinedDocs.add(docId);
+                return true;
             }
 
-            // Leave document
-            await this.socket.leaveDoc(docId);
+            // Keep doc joined for watching even if no changes
+            this.joinedDocs.add(docId);
+            return false;
         } catch (error) {
             console.error(`[LocalLeaf] OT update failed for ${path}:`, error);
             throw error;
@@ -484,7 +592,18 @@ export class SyncEngine {
         if (!this.acquireLock(relativePath)) return;
 
         try {
-            const stat = await vscode.workspace.fs.stat(uri);
+            // Stat the file - may throw if file was deleted between watcher event and now
+            let stat: vscode.FileStat;
+            try {
+                stat = await vscode.workspace.fs.stat(uri);
+            } catch (statError) {
+                if (isFileNotFoundError(statError)) {
+                    debugLog(`File no longer exists (race condition): ${relativePath}`);
+                    return;
+                }
+                throw statError;
+            }
+
             const projectSettings = this.settings.getSettings()!;
 
             this.setStatus('pushing', `Creating ${relativePath}`, relativePath);
@@ -499,7 +618,18 @@ export class SyncEngine {
             if (stat.type === vscode.FileType.Directory) {
                 await this.api.addFolder(projectSettings.projectId, parentId!, name);
             } else {
-                const content = await vscode.workspace.fs.readFile(uri);
+                // Read file content - may throw if file was deleted
+                let content: Uint8Array;
+                try {
+                    content = await vscode.workspace.fs.readFile(uri);
+                } catch (readError) {
+                    if (isFileNotFoundError(readError)) {
+                        debugLog(`File no longer exists (race condition): ${relativePath}`);
+                        return;
+                    }
+                    throw readError;
+                }
+
                 const isTextFile = this.isTextFile(name);
 
                 if (isTextFile) {
@@ -514,6 +644,12 @@ export class SyncEngine {
 
             this.setStatus('idle');
         } catch (error) {
+            // Don't show error for file-not-found during rapid operations
+            if (isFileNotFoundError(error)) {
+                debugLog(`File disappeared during create: ${relativePath}`);
+                this.setStatus('idle');
+                return;
+            }
             console.error(`[LocalLeaf] Failed to create ${relativePath}:`, error);
             this.setStatus('error', `Failed to create: ${error}`);
         } finally {
@@ -584,13 +720,38 @@ export class SyncEngine {
             if (type === 'folder') {
                 await vscode.workspace.fs.createDirectory(localUri);
             } else {
-                // Download content
+                // Download content - use correct API based on type
                 const projectSettings = this.settings.getSettings()!;
-                const result = await this.api.getFile(projectSettings.projectId, entity._id);
-                if (result.type === 'success' && result.content) {
-                    await vscode.workspace.fs.writeFile(localUri, result.content);
-                    this.baseContent.set(path, result.content);
-                    this.fileCache.set(path, { hash: hashContent(result.content), timestamp: Date.now() });
+                let content: Uint8Array | undefined;
+
+                if (type === 'doc') {
+                    // For docs, use getDocContent
+                    const result = await this.api.getDocContent(projectSettings.projectId, entity._id);
+                    if (result.type === 'success' && result.lines) {
+                        content = new TextEncoder().encode(result.lines.join('\n'));
+                    }
+                } else {
+                    // For binary files, use getFile
+                    const result = await this.api.getFile(projectSettings.projectId, entity._id);
+                    if (result.type === 'success' && result.content) {
+                        content = result.content;
+                    }
+                }
+
+                if (content) {
+                    await vscode.workspace.fs.writeFile(localUri, content);
+                    this.baseContent.set(path, content);
+                    this.fileCache.set(path, { hash: hashContent(content), timestamp: Date.now() });
+                }
+
+                // Join new docs to receive OT updates
+                if (type === 'doc' && this.socket && !this.joinedDocs.has(entity._id)) {
+                    try {
+                        await this.socket.joinDoc(entity._id);
+                        this.joinedDocs.add(entity._id);
+                    } catch {
+                        // Ignore join errors
+                    }
                 }
             }
 
@@ -662,6 +823,16 @@ export class SyncEngine {
         try {
             this.setStatus('pulling', `Deleting ${entry.path}`, entry.path);
 
+            // Leave doc if joined
+            if (entry.type === 'doc' && this.joinedDocs.has(entityId)) {
+                try {
+                    await this.socket?.leaveDoc(entityId);
+                } catch {
+                    // Ignore leave errors
+                }
+                this.joinedDocs.delete(entityId);
+            }
+
             // Remove from tree
             this.fileTree.delete(entityId);
             this.fileTreeByPath.delete(entry.path);
@@ -722,30 +893,25 @@ export class SyncEngine {
      * Handle remote file content changed (OT update)
      */
     private async handleRemoteFileChanged(update: DocumentUpdate): Promise<void> {
-        console.log('[LocalLeaf] handleRemoteFileChanged: Received OT update for doc', update.doc);
-
         const entry = this.fileTree.get(update.doc);
         if (!entry || entry.type !== 'doc') {
-            console.log('[LocalLeaf] handleRemoteFileChanged: Entry not found or not a doc');
             return;
         }
-
-        console.log('[LocalLeaf] handleRemoteFileChanged: Updating', entry.path);
 
         if (!this.shouldSync(entry.path)) return;
         if (!this.acquireLock(entry.path)) return;
 
         try {
-            this.setStatus('pulling', `Updating ${entry.path}`, entry.path);
-
             // Get current local content
             const localUri = this.settings.getFilePath(entry.path);
             let localContent: string;
+            let localBytes: Uint8Array | undefined;
             try {
-                const bytes = await vscode.workspace.fs.readFile(localUri);
-                localContent = new TextDecoder().decode(bytes);
+                localBytes = await vscode.workspace.fs.readFile(localUri);
+                localContent = new TextDecoder().decode(localBytes);
             } catch {
                 localContent = '';
+                localBytes = undefined;
             }
 
             // Apply OT operations
@@ -763,9 +929,14 @@ export class SyncEngine {
                 }
             }
 
-            // Write updated content
+            // Only write if content actually changed (prevents file flashing)
             const contentBytes = new TextEncoder().encode(newContent);
-            await vscode.workspace.fs.writeFile(localUri, contentBytes);
+            if (!contentEquals(localBytes, contentBytes)) {
+                this.setStatus('pulling', `Updating ${entry.path}`, entry.path);
+                await vscode.workspace.fs.writeFile(localUri, contentBytes);
+                this.log(`Remote update: ${entry.path}`);
+            }
+
             this.baseContent.set(entry.path, contentBytes);
             this.fileCache.set(entry.path, { hash: hashContent(contentBytes), timestamp: Date.now() });
 
@@ -775,6 +946,46 @@ export class SyncEngine {
         } finally {
             this.releaseLock(entry.path);
         }
+    }
+
+    /**
+     * Join all documents to receive real-time OT updates
+     */
+    async joinAllDocsForWatching(): Promise<void> {
+        if (!this.socket) return;
+
+        let joinedCount = 0;
+        for (const [id, entry] of this.fileTree) {
+            if (entry.type === 'doc' && !this.joinedDocs.has(id)) {
+                if (!this.shouldSync(entry.path)) continue;
+                try {
+                    await this.socket.joinDoc(id);
+                    this.joinedDocs.add(id);
+                    joinedCount++;
+                } catch {
+                    // Ignore join errors for individual docs
+                }
+            }
+        }
+        if (joinedCount > 0) {
+            this.log(`Watching ${joinedCount} documents for remote changes`);
+        }
+    }
+
+    /**
+     * Leave all joined documents
+     */
+    private async leaveAllDocs(): Promise<void> {
+        if (!this.socket) return;
+
+        for (const docId of this.joinedDocs) {
+            try {
+                await this.socket.leaveDoc(docId);
+            } catch {
+                // Ignore leave errors
+            }
+        }
+        this.joinedDocs.clear();
     }
 
     // === Public methods ===
@@ -803,9 +1014,13 @@ export class SyncEngine {
     private async hasConflict(localUri: vscode.Uri, remoteContent: Uint8Array): Promise<boolean> {
         try {
             const localContent = await vscode.workspace.fs.readFile(localUri);
-            const localHash = hashContent(localContent);
-            const remoteHash = hashContent(remoteContent);
-            return localHash !== remoteHash;
+            const isEqual = contentEquals(localContent, remoteContent);
+            if (!isEqual) {
+                debugLog('hasConflict: DIFFERENT', localUri.fsPath,
+                    'local:', localContent.length, 'bytes',
+                    'remote:', remoteContent.length, 'bytes');
+            }
+            return !isEqual;
         } catch {
             return false; // File doesn't exist locally, no conflict
         }
@@ -909,9 +1124,9 @@ export class SyncEngine {
             throw new Error('Not connected');
         }
 
-        console.log('[LocalLeaf] pullAll: Starting pull');
-        console.log('[LocalLeaf] pullAll: File tree size:', this.fileTree.size);
-        console.log('[LocalLeaf] pullAll: Project name:', this.project.name);
+        debugLog('pullAll: Starting pull');
+        debugLog('pullAll: File tree size:', this.fileTree.size);
+        debugLog('pullAll: Project name:', this.project.name);
 
         // Reset conflict resolution state
         this.conflictResolution = 'ask';
@@ -926,7 +1141,7 @@ export class SyncEngine {
 
         try {
             const downloadFile = async (entry: FileTreeEntry) => {
-                console.log('[LocalLeaf] pullAll: Processing', entry.path, entry.type);
+                debugLog('pullAll: Processing', entry.path, entry.type);
 
                 if (entry.type === 'folder') {
                     const localUri = this.settings.getFilePath(entry.path);
@@ -935,34 +1150,50 @@ export class SyncEngine {
                 }
 
                 if (this.ignoreParser.shouldIgnore(entry.path)) {
-                    console.log('[LocalLeaf] pullAll: Ignored', entry.path);
+                    debugLog('pullAll: Ignored', entry.path);
                     return;
                 }
 
                 // Get remote content - docs use joinDoc via socket, files use HTTP
                 let remoteContent: Uint8Array;
 
-                if (entry.type === 'doc' && this.socket) {
-                    // For docs, use socket.io joinDoc to get content
-                    try {
-                        const { lines } = await this.socket.joinDoc(entry.id);
-                        const content = lines.join('\n');
+                if (entry.type === 'doc') {
+                    // For docs, try socket first, fall back to HTTP
+                    if (this.socket) {
+                        try {
+                            const { lines } = await this.socket.joinDoc(entry.id);
+                            const content = lines.join('\n');
+                            remoteContent = new TextEncoder().encode(content);
+                            await this.socket.leaveDoc(entry.id);
+                            debugLog('pullAll: Got doc via socket', entry.path,
+                                'lines:', lines.length,
+                                'contentLen:', content.length);
+                        } catch (err) {
+                            debugLog('pullAll: Failed to joinDoc', entry.path, err);
+                            return;
+                        }
+                    } else {
+                        // HTTP fallback for docs
+                        const result = await this.api.getDocContent(projectSettings.projectId, entry.id);
+                        if (result.type !== 'success' || !result.lines) {
+                            debugLog('pullAll: Failed to get doc via HTTP', entry.path);
+                            return;
+                        }
+                        const content = result.lines.join('\n');
                         remoteContent = new TextEncoder().encode(content);
-                        // Leave the doc after getting content
-                        await this.socket.leaveDoc(entry.id);
-                        console.log('[LocalLeaf] pullAll: Got doc content via socket', entry.path, 'lines:', lines.length);
-                    } catch (err) {
-                        console.log('[LocalLeaf] pullAll: Failed to joinDoc', entry.path, err);
-                        return;
+                        debugLog('pullAll: Got doc via HTTP', entry.path,
+                            'lines:', result.lines.length,
+                            'contentLen:', content.length);
                     }
                 } else {
                     // For binary files, use HTTP API
                     const result = await this.api.getFile(projectSettings.projectId, entry.id);
                     if (result.type !== 'success' || !result.content) {
-                        console.log('[LocalLeaf] pullAll: Failed to get file', entry.path);
+                        debugLog('pullAll: Failed to get file', entry.path);
                         return;
                     }
                     remoteContent = result.content;
+                    debugLog('pullAll: Got file via HTTP', entry.path, 'size:', result.content.length);
                 }
 
                 const localUri = this.settings.getFilePath(entry.path);
@@ -976,14 +1207,14 @@ export class SyncEngine {
                         const resolution = await this.askConflictResolution(entry.path, localUri, remoteContent);
 
                         if (resolution === 'skip') {
-                            console.log('[LocalLeaf] pullAll: Skipped (user choice)', entry.path);
+                            debugLog('pullAll: Skipped (user choice)', entry.path);
                             skippedCount++;
                             return;
                         }
 
                         if (resolution === 'useLocal') {
                             // Push local content to Overleaf
-                            console.log('[LocalLeaf] pullAll: Using local, pushing to Overleaf', entry.path);
+                            debugLog('pullAll: Using local, pushing to Overleaf', entry.path);
                             this.setStatus('pushing', `Uploading ${entry.path}`, entry.path);
                             const localContent = await vscode.workspace.fs.readFile(localUri);
 
@@ -1006,13 +1237,29 @@ export class SyncEngine {
                     }
                 }
 
-                // Download file
+                // Download file only if content is different (prevents file flashing)
+                let localContent: Uint8Array | undefined;
+                if (exists) {
+                    try {
+                        localContent = await vscode.workspace.fs.readFile(localUri);
+                    } catch {
+                        localContent = undefined;
+                    }
+                }
+
+                // Skip write if content is identical
+                if (contentEquals(localContent, remoteContent)) {
+                    // Content is the same, just update cache
+                    this.baseContent.set(entry.path, remoteContent);
+                    this.fileCache.set(entry.path, { hash: hashContent(remoteContent), timestamp: Date.now() });
+                    return;
+                }
+
                 this.setStatus('pulling', `Downloading ${entry.path}`, entry.path);
                 await vscode.workspace.fs.writeFile(localUri, remoteContent);
                 this.baseContent.set(entry.path, remoteContent);
                 this.fileCache.set(entry.path, { hash: hashContent(remoteContent), timestamp: Date.now() });
                 downloadedCount++;
-                console.log('[LocalLeaf] pullAll: Downloaded', entry.path);
             };
 
             // Download all files
@@ -1023,7 +1270,7 @@ export class SyncEngine {
             await this.settings.updateLastSynced();
 
             const message = `Pull complete: ${downloadedCount} downloaded, ${skippedCount} skipped, ${conflictCount} conflicts`;
-            console.log('[LocalLeaf] pullAll:', message);
+            debugLog('pullAll:', message);
             this.setStatus('idle', message);
         } catch (error) {
             this.setStatus('error', `Pull failed: ${error}`);

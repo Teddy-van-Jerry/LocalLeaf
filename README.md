@@ -40,7 +40,7 @@ A VS Code extension for a workaround solution to collaborate on LaTeX documents 
 | `LocalLeaf: Sync Now` | Manually trigger two-way sync |
 | `LocalLeaf: Pull from Overleaf` | Download changes from Overleaf |
 | `LocalLeaf: Push to Overleaf` | Upload local changes to Overleaf |
-| `LocalLeaf: Show Sync Status` | Display current sync status |
+| `LocalLeaf: Show Sync Status` | Display sync status and options to resync/reconnect |
 | `LocalLeaf: Edit Ignore Patterns` | Configure files to exclude from sync |
 | `LocalLeaf: Set Main Document` | Set the main `.tex` file for compilation |
 | `LocalLeaf: Configure Settings` | Open extension settings |

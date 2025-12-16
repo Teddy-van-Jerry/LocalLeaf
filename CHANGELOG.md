@@ -2,6 +2,30 @@
 
 All notable changes to LocalLeaf will be documented in this file.
 
+## [0.1.1] - 2025-12-16
+
+### Fixed
+
+- Fixed "Failed to sync: EntryNotFound (FileSystemError)" race condition during rapid file operations (e.g., git checkout)
+- Fixed file flashing in editor when receiving OT updates with no actual content changes
+- Fixed real-time sync not receiving remote changes (documents now stay joined for OT updates)
+- Fixed `.leafignore` patterns not working when main document differs from default (now auto-detects from Overleaf project)
+- Fixed cursor tracking not updating for some cursor movements
+
+### Added
+
+- Resync option in status bar menu when sync errors occur
+- Reconnect option in status bar menu when disconnected
+- Real-time sync status in Output panel ("Pushed to Overleaf", "Remote update" messages)
+- Auto-detection of main document from Overleaf project settings
+- Project website is now live at https://localleaf.wqzhao.org
+
+### Changed
+
+- Simplified socket connection to use v2 scheme directly
+- Reduced verbose console logging in production
+
+
 ## [0.1.0] - 2025-12-13
 
 ### Added

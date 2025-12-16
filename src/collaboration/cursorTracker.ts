@@ -302,7 +302,7 @@ export class CursorTracker {
      * Handle local selection change to update our position
      */
     private async handleLocalSelectionChange(event: vscode.TextEditorSelectionChangeEvent): Promise<void> {
-        if (event.kind === undefined) return;
+        // Don't filter by event.kind - we want to track all cursor movements
 
         const uri = event.textEditor.document.uri;
         if (uri.scheme !== 'file') return;

@@ -218,8 +218,6 @@ export class BaseAPI {
      */
     initSocket(identity: Identity, query?: string): any {
         const socketUrl = new URL(this.url).origin + (query ?? '');
-        console.log('[LocalLeaf] initSocket URL:', socketUrl);
-        console.log('[LocalLeaf] initSocket cookies length:', identity.cookies?.length || 0);
 
         const io = require('socket.io-client');
         const socket = io.connect(socketUrl, {
@@ -230,16 +228,6 @@ export class BaseAPI {
                 'Cookie': identity.cookies,
             },
         });
-
-        // Debug: Log all socket events
-        const originalOn = socket.on.bind(socket);
-        socket.on = function(event: string, handler: Function) {
-            console.log(`[LocalLeaf] Socket registering handler for: ${event}`);
-            return originalOn(event, (...args: any[]) => {
-                console.log(`[LocalLeaf] Socket event fired: ${event}`, args.length > 0 ? `(${args.length} args)` : '');
-                return handler(...args);
-            });
-        };
 
         return socket;
     }

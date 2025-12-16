@@ -29,8 +29,6 @@ let statusUpdateInterval: NodeJS.Timeout | undefined;
  * Extension activation
  */
 export async function activate(context: vscode.ExtensionContext) {
-    console.log('[LocalLeaf] Extension activating...');
-
     try {
 
     // Initialize output channel
@@ -39,8 +37,6 @@ export async function activate(context: vscode.ExtensionContext) {
 
     // Share output channel with socketio module for logging
     setOutputChannel(outputChannel);
-    outputChannel.appendLine('[LocalLeaf] Extension activating...');
-    outputChannel.show(true); // Show output panel
 
     // Initialize credential manager
     credentialManager = CredentialManager.initialize(context);
@@ -93,7 +89,6 @@ export async function activate(context: vscode.ExtensionContext) {
     }
 
     log('LocalLeaf activated');
-    console.log('[LocalLeaf] Extension activated successfully');
 
     } catch (error) {
         console.error('[LocalLeaf] Activation error:', error);
@@ -105,7 +100,6 @@ export async function activate(context: vscode.ExtensionContext) {
  * Register all commands
  */
 function registerCommands(context: vscode.ExtensionContext) {
-    console.log('[LocalLeaf] Registering commands...');
     context.subscriptions.push(
         vscode.commands.registerCommand(COMMANDS.LOGIN, cmdLogin),
         vscode.commands.registerCommand(COMMANDS.LOGOUT, cmdLogout),
@@ -120,7 +114,6 @@ function registerCommands(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand(COMMANDS.CONFIGURE, cmdConfigure),
         vscode.commands.registerCommand(COMMANDS.JUMP_TO_COLLABORATOR, cmdJumpToCollaborator),
     );
-    console.log('[LocalLeaf] Commands registered successfully');
 }
 
 /**
@@ -143,7 +136,7 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
     api.setIdentity(credential.identity);
 
     // Create sync engine
-    syncEngine = new SyncEngine(api, settings);
+    syncEngine = new SyncEngine(api, settings, log);
 
     // Listen to status changes
     syncEngine.onStatusChange(event => {
@@ -167,11 +160,19 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
 
         log('Sync engine connected');
 
+        // Auto-detect main document from project settings
+        await syncEngine.detectMainDocument();
+
         // Auto-pull on project load
         try {
             log('Auto-pulling files from Overleaf...');
             await syncEngine.pullAll();
             log('Auto-pull complete');
+
+            // Join all docs to receive real-time OT updates
+            await syncEngine.joinAllDocsForWatching();
+            log('Watching for remote changes');
+
             vscode.window.showInformationMessage(`LocalLeaf: Synced with "${projectSettings.projectName}"`);
         } catch (pullError) {
             log(`Auto-pull failed: ${pullError}`);
@@ -648,6 +649,7 @@ async function cmdShowSyncStatus() {
     const settings = settingsManager?.getSettings();
 
     const items: vscode.QuickPickItem[] = [];
+    const currentStatus = syncEngine?.status || 'disconnected';
 
     if (settings) {
         items.push({
@@ -661,7 +663,7 @@ async function cmdShowSyncStatus() {
         });
         items.push({
             label: '$(sync) Status',
-            description: syncEngine?.status || 'disconnected',
+            description: currentStatus,
         });
         if (cursorTracker) {
             items.push({
@@ -684,6 +686,22 @@ async function cmdShowSyncStatus() {
 
     items.push({ label: '', kind: vscode.QuickPickItemKind.Separator });
 
+    // Show resync option when there's an error or when connected
+    if (settings && (currentStatus === 'error' || currentStatus === 'idle')) {
+        items.push({
+            label: '$(sync) Resync with Overleaf',
+            description: currentStatus === 'error' ? 'Retry after error' : 'Pull latest changes',
+        });
+    }
+
+    // Show reconnect option when disconnected
+    if (settings && currentStatus === 'disconnected') {
+        items.push({
+            label: '$(debug-disconnect) Reconnect',
+            description: 'Reconnect to Overleaf',
+        });
+    }
+
     if (cursorTracker && cursorTracker.getUserCount() > 0) {
         items.push({
             label: '$(person) Jump to collaborator...',
@@ -702,10 +720,77 @@ async function cmdShowSyncStatus() {
         title: 'LocalLeaf Status',
     });
 
-    if (selected?.label.includes('Jump to collaborator')) {
+    if (selected?.label.includes('Resync')) {
+        await cmdPullFromOverleaf();
+    } else if (selected?.label.includes('Reconnect')) {
+        await cmdReconnect();
+    } else if (selected?.label.includes('Jump to collaborator')) {
         await cursorTracker?.jumpToUser();
     } else if (selected?.label.includes('Unlink folder')) {
         await cmdUnlinkFolder();
+    }
+}
+
+/**
+ * Reconnect to Overleaf (after disconnect or error)
+ */
+async function cmdReconnect() {
+    const settingsManager = SettingsManager.getCurrentInstance();
+    if (!settingsManager || !(await settingsManager.isLinked())) {
+        vscode.window.showWarningMessage('LocalLeaf: No linked project');
+        return;
+    }
+
+    // Disconnect existing sync engine
+    if (syncEngine) {
+        syncEngine.disconnect();
+        syncEngine = undefined;
+    }
+
+    if (cursorTracker) {
+        cursorTracker.dispose();
+        cursorTracker = undefined;
+    }
+
+    stopStatusUpdates();
+
+    const projectSettings = settingsManager.getSettings();
+    if (!projectSettings) return;
+
+    const credential = await credentialManager.getCredential(projectSettings.serverUrl);
+    if (!credential) {
+        updateStatusBar('disconnected', 'Not logged in');
+        vscode.window.showWarningMessage('LocalLeaf: Please login to Overleaf first');
+        return;
+    }
+
+    const api = new BaseAPI(projectSettings.serverUrl);
+    api.setIdentity(credential.identity);
+
+    syncEngine = new SyncEngine(api, settingsManager);
+
+    syncEngine.onStatusChange(event => {
+        updateStatusBar(event.status, event.message);
+    });
+
+    try {
+        updateStatusBar('syncing', 'Reconnecting...');
+        await syncEngine.connect();
+
+        const socket = syncEngine.getSocket();
+        if (socket) {
+            cursorTracker = new CursorTracker(socket, settingsManager);
+            await cursorTracker.initialize();
+        }
+
+        startStatusUpdates();
+        log('Reconnected to Overleaf');
+
+        await syncEngine.pullAll();
+        vscode.window.showInformationMessage(`LocalLeaf: Reconnected to "${projectSettings.projectName}"`);
+    } catch (error) {
+        log(`Failed to reconnect: ${error}`);
+        vscode.window.showErrorMessage(`LocalLeaf: Failed to reconnect - ${error}`);
     }
 }
 
