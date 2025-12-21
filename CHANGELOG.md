@@ -2,6 +2,24 @@
 
 All notable changes to LocalLeaf will be documented in this file.
 
+## [0.1.2] - 2025-12-21
+
+### Fixed
+
+- Fixed critical bug where new files created on Overleaf were incorrectly deleted when they didn't exist locally
+- Files are now only deleted from Overleaf if they were previously synced locally (tracked in baseContent)
+
+### Changed
+
+- New files from Overleaf now require user acceptance before downloading (Download/Skip/Download All New/Skip All New)
+- This applies to both manual pull and real-time sync when collaborators create files
+
+### Added
+
+- Detection of files deleted on Overleaf during pull (prompts user to delete locally, keep, or re-upload)
+- Detection of local-only files during pull (prompts user to upload or ignore)
+- Logging when files are deleted from Overleaf
+
 ## [0.1.1] - 2025-12-16
 
 ### Fixed

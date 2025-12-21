@@ -669,6 +669,15 @@ export class SyncEngine {
             const entry = this.fileTreeByPath.get(relativePath);
             if (!entry) return;
 
+            // Only delete from Overleaf if the file was previously synced locally.
+            // If baseContent doesn't have this path, the file was never downloaded/synced,
+            // so we should NOT propagate this deletion to Overleaf (prevents deleting
+            // new upstream files that haven't been pulled yet).
+            if (!this.baseContent.has(relativePath)) {
+                debugLog(`Ignoring delete for never-synced file: ${relativePath}`);
+                return;
+            }
+
             const projectSettings = this.settings.getSettings()!;
             this.setStatus('pushing', `Deleting ${relativePath}`, relativePath);
 
@@ -679,6 +688,7 @@ export class SyncEngine {
             this.baseContent.delete(relativePath);
             this.fileCache.delete(relativePath);
 
+            this.log(`Deleted from Overleaf: ${relativePath}`);
             this.setStatus('idle');
         } catch (error) {
             console.error(`[LocalLeaf] Failed to delete ${relativePath}:`, error);
@@ -719,6 +729,8 @@ export class SyncEngine {
 
             if (type === 'folder') {
                 await vscode.workspace.fs.createDirectory(localUri);
+                // Track folders in baseContent with empty content
+                this.baseContent.set(path, new Uint8Array(0));
             } else {
                 // Download content - use correct API based on type
                 const projectSettings = this.settings.getSettings()!;
@@ -739,9 +751,19 @@ export class SyncEngine {
                 }
 
                 if (content) {
+                    // Prompt user for new remote files
+                    const resolution = await this.askNewRemoteFileResolution(path, content);
+                    if (resolution === 'skip') {
+                        debugLog(`Skipped new remote file (user choice): ${path}`);
+                        this.log(`Skipped new file from Overleaf: ${path}`);
+                        this.setStatus('idle');
+                        return;
+                    }
+
                     await vscode.workspace.fs.writeFile(localUri, content);
                     this.baseContent.set(path, content);
                     this.fileCache.set(path, { hash: hashContent(content), timestamp: Date.now() });
+                    this.log(`Downloaded new file from Overleaf: ${path}`);
                 }
 
                 // Join new docs to receive OT updates
@@ -1117,6 +1139,157 @@ export class SyncEngine {
     }
 
     /**
+     * Ask user how to handle a new file from Overleaf that doesn't exist locally
+     */
+    private async askNewRemoteFileResolution(filePath: string, remoteContent: Uint8Array): Promise<'useRemote' | 'skip'> {
+        if (this.applyToAll && this.conflictResolution !== 'ask') {
+            return this.conflictResolution === 'useRemote' ? 'useRemote' : 'skip';
+        }
+
+        const sizeStr = remoteContent.length < 1024
+            ? `${remoteContent.length} bytes`
+            : `${(remoteContent.length / 1024).toFixed(1)} KB`;
+
+        const choice = await vscode.window.showInformationMessage(
+            `New file on Overleaf: "${filePath}" (${sizeStr})`,
+            'Download',
+            'Skip',
+            'Download All New',
+            'Skip All New'
+        );
+
+        switch (choice) {
+            case 'Download':
+                return 'useRemote';
+            case 'Download All New':
+                this.conflictResolution = 'useRemote';
+                this.applyToAll = true;
+                return 'useRemote';
+            case 'Skip All New':
+                this.conflictResolution = 'skip';
+                this.applyToAll = true;
+                return 'skip';
+            default:
+                return 'skip';
+        }
+    }
+
+    /**
+     * Handle local files that were deleted on Overleaf.
+     * These are files that exist locally, were previously synced (in baseContent),
+     * but no longer exist on Overleaf.
+     */
+    private async handleOrphanedLocalFiles(orphanedPaths: string[]): Promise<void> {
+        if (orphanedPaths.length === 0) return;
+
+        const fileList = orphanedPaths.length <= 5
+            ? orphanedPaths.join(', ')
+            : `${orphanedPaths.slice(0, 5).join(', ')}... and ${orphanedPaths.length - 5} more`;
+
+        const choice = await vscode.window.showWarningMessage(
+            `${orphanedPaths.length} file(s) were deleted on Overleaf but exist locally: ${fileList}`,
+            { modal: false },
+            'Delete Locally',
+            'Keep Locally',
+            'Re-upload'
+        );
+
+        if (choice === 'Delete Locally') {
+            for (const path of orphanedPaths) {
+                try {
+                    const localUri = this.settings.getFilePath(path);
+                    await vscode.workspace.fs.delete(localUri, { recursive: false });
+                    this.baseContent.delete(path);
+                    this.fileCache.delete(path);
+                    this.log(`Deleted local file (removed from Overleaf): ${path}`);
+                } catch (error) {
+                    console.error(`[LocalLeaf] Failed to delete local file: ${path}`, error);
+                }
+            }
+        } else if (choice === 'Re-upload') {
+            for (const path of orphanedPaths) {
+                try {
+                    await this.uploadLocalFile(path);
+                    this.log(`Re-uploaded to Overleaf: ${path}`);
+                } catch (error) {
+                    console.error(`[LocalLeaf] Failed to re-upload: ${path}`, error);
+                }
+            }
+        } else {
+            // Keep Locally - clear from baseContent so it's not tracked as synced
+            for (const path of orphanedPaths) {
+                this.baseContent.delete(path);
+                debugLog(`Keeping local file, removed from sync tracking: ${path}`);
+            }
+        }
+    }
+
+    /**
+     * Handle files that exist only locally (not on Overleaf, never synced).
+     * These could be new files the user wants to upload or files to ignore.
+     */
+    private async handleLocalOnlyFiles(localOnlyPaths: string[]): Promise<void> {
+        if (localOnlyPaths.length === 0) return;
+
+        const fileList = localOnlyPaths.length <= 5
+            ? localOnlyPaths.join(', ')
+            : `${localOnlyPaths.slice(0, 5).join(', ')}... and ${localOnlyPaths.length - 5} more`;
+
+        const choice = await vscode.window.showInformationMessage(
+            `${localOnlyPaths.length} local file(s) not on Overleaf: ${fileList}`,
+            { modal: false },
+            'Upload All',
+            'Ignore'
+        );
+
+        if (choice === 'Upload All') {
+            for (const path of localOnlyPaths) {
+                try {
+                    await this.uploadLocalFile(path);
+                    this.log(`Uploaded new file: ${path}`);
+                } catch (error) {
+                    console.error(`[LocalLeaf] Failed to upload: ${path}`, error);
+                }
+            }
+        }
+        // 'Ignore' - do nothing, files stay local only
+    }
+
+    /**
+     * Upload a local file to Overleaf (create new entity).
+     */
+    private async uploadLocalFile(relativePath: string): Promise<void> {
+        const projectSettings = this.settings.getSettings()!;
+        const localUri = this.settings.getFilePath(relativePath);
+        const content = await vscode.workspace.fs.readFile(localUri);
+
+        // Determine parent folder
+        const parentPath = relativePath.substring(0, relativePath.lastIndexOf('/') + 1) || '/';
+        const parentEntry = this.fileTreeByPath.get(parentPath);
+        const parentId = parentEntry?.id || this.project?.rootFolder[0]._id;
+
+        if (!parentId) {
+            throw new Error(`Cannot find parent folder for ${relativePath}`);
+        }
+
+        const name = relativePath.split('/').pop()!;
+        const isTextFile = this.isTextFile(name);
+
+        this.setStatus('pushing', `Uploading ${relativePath}`, relativePath);
+
+        if (isTextFile) {
+            await this.api.addDoc(projectSettings.projectId, parentId, name);
+            // Note: addDoc creates an empty doc, we need to push content after
+            // The file tree will be updated via socket events
+        } else {
+            await this.api.uploadFile(projectSettings.projectId, parentId, name, content);
+        }
+
+        this.baseContent.set(relativePath, content);
+        this.fileCache.set(relativePath, { hash: hashContent(content), timestamp: Date.now() });
+    }
+
+    /**
      * Perform full sync (pull all files)
      */
     async pullAll(): Promise<void> {
@@ -1146,6 +1319,8 @@ export class SyncEngine {
                 if (entry.type === 'folder') {
                     const localUri = this.settings.getFilePath(entry.path);
                     await vscode.workspace.fs.createDirectory(localUri);
+                    // Track folders in baseContent with empty content
+                    this.baseContent.set(entry.path, new Uint8Array(0));
                     return;
                 }
 
@@ -1198,8 +1373,9 @@ export class SyncEngine {
 
                 const localUri = this.settings.getFilePath(entry.path);
                 const exists = await this.localFileExists(localUri);
+                const wasSynced = this.baseContent.has(entry.path);
 
-                // Check for conflicts
+                // Check for conflicts or new remote files
                 if (exists) {
                     const hasConflict = await this.hasConflict(localUri, remoteContent);
                     if (hasConflict) {
@@ -1235,6 +1411,17 @@ export class SyncEngine {
                         }
                         // resolution === 'useRemote' - continue to download
                     }
+                } else if (!wasSynced) {
+                    // New file on Overleaf that doesn't exist locally - prompt user
+                    conflictCount++;
+                    const resolution = await this.askNewRemoteFileResolution(entry.path, remoteContent);
+
+                    if (resolution === 'skip') {
+                        debugLog('pullAll: Skipped new remote file (user choice)', entry.path);
+                        skippedCount++;
+                        return;
+                    }
+                    // resolution === 'useRemote' - continue to download
                 }
 
                 // Download file only if content is different (prevents file flashing)
@@ -1265,6 +1452,59 @@ export class SyncEngine {
             // Download all files
             for (const entry of this.fileTree.values()) {
                 await downloadFile(entry);
+            }
+
+            // Detect files that were deleted on Overleaf but exist locally
+            // (files in baseContent but not in fileTreeByPath)
+            const orphanedPaths: string[] = [];
+            for (const [syncedPath] of this.baseContent) {
+                // Skip if still exists on Overleaf
+                if (this.fileTreeByPath.has(syncedPath)) continue;
+                // Skip folders
+                if (syncedPath.endsWith('/')) continue;
+                // Skip ignored files
+                if (this.ignoreParser.shouldIgnore(syncedPath)) continue;
+                // Check if local file actually exists
+                const localUri = this.settings.getFilePath(syncedPath);
+                if (await this.localFileExists(localUri)) {
+                    orphanedPaths.push(syncedPath);
+                }
+            }
+            if (orphanedPaths.length > 0) {
+                await this.handleOrphanedLocalFiles(orphanedPaths);
+            }
+
+            // Detect local-only files (exist locally but not on Overleaf or in baseContent)
+            const localOnlyPaths: string[] = [];
+            const workspaceFolder = this.settings.getWorkspaceFolder();
+            const scanLocalFiles = async (dirUri: vscode.Uri, basePath: string = '/'): Promise<void> => {
+                try {
+                    const entries = await vscode.workspace.fs.readDirectory(dirUri);
+                    for (const [name, type] of entries) {
+                        const relativePath = basePath + name;
+                        const fullPath = type === vscode.FileType.Directory
+                            ? relativePath + '/'
+                            : relativePath;
+
+                        // Skip ignored files
+                        if (this.ignoreParser.shouldIgnore(fullPath)) continue;
+
+                        if (type === vscode.FileType.Directory) {
+                            await scanLocalFiles(vscode.Uri.joinPath(dirUri, name), fullPath);
+                        } else {
+                            // Check if this file is known to Overleaf or baseContent
+                            if (!this.fileTreeByPath.has(fullPath) && !this.baseContent.has(fullPath)) {
+                                localOnlyPaths.push(fullPath);
+                            }
+                        }
+                    }
+                } catch (error) {
+                    debugLog(`Error scanning directory: ${basePath}`, error);
+                }
+            };
+            await scanLocalFiles(workspaceFolder);
+            if (localOnlyPaths.length > 0) {
+                await this.handleLocalOnlyFiles(localOnlyPaths);
             }
 
             await this.settings.updateLastSynced();
