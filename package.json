@@ -2,8 +2,8 @@
   "name": "localleaf",
   "displayName": "LocalLeaf",
   "description": "Local LaTeX Editing yet Synced to Overleaf",
-  "version": "0.1.3",
-  "publisher": "teddy-van-jerry",
+  "version": "0.2.1",
+  "publisher": "asixa",
   "repository": {
     "type": "git",
     "url": "https://github.com/Teddy-van-Jerry/LocalLeaf"
@@ -23,10 +23,45 @@
     "tex"
   ],
   "activationEvents": [
-    "workspaceContains:.localleaf"
+    "workspaceContains:.localleaf",
+    "workspaceContains:**/.localleaf/settings.json",
+    "onView:localleaf.projectsView",
+    "onView:localleaf.mainView"
+  ],
+  "extensionDependencies": [
+    "vscode.git"
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "configurationDefaults": {
+      "workbench.view.alwaysShowHeaderActions": true
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "localleaf",
+          "title": " ",
+          "icon": "images/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "localleaf": [
+        {
+          "id": "localleaf.projectsView",
+          "name": "Projects",
+          "type": "webview",
+          "when": "!localleaf.isLinked"
+        },
+        {
+          "id": "localleaf.mainView",
+          "name": " ",
+          "type": "webview",
+          "when": "localleaf.isLinked"
+        }
+      ]
+    },
+    "viewsWelcome": [],
     "commands": [
       {
         "command": "localleaf.login",
@@ -34,7 +69,12 @@
       },
       {
         "command": "localleaf.logout",
-        "title": "LocalLeaf: Logout"
+        "title": "LocalLeaf: Logout",
+        "icon": "$(sign-out)"
+      },
+      {
+        "command": "localleaf.showAccountPanel",
+        "title": "LocalLeaf: Account"
       },
       {
         "command": "localleaf.linkFolder",
@@ -42,23 +82,23 @@
       },
       {
         "command": "localleaf.unlinkFolder",
-        "title": "LocalLeaf: Unlink Folder"
-      },
-      {
-        "command": "localleaf.syncNow",
-        "title": "LocalLeaf: Sync Now"
+        "title": "LocalLeaf: Unlink Folder",
+        "icon": "$(debug-disconnect)"
       },
       {
         "command": "localleaf.pullFromOverleaf",
-        "title": "LocalLeaf: Pull from Overleaf"
+        "title": "LocalLeaf: Pull from Overleaf",
+        "icon": "$(cloud-download)"
       },
       {
         "command": "localleaf.pushToOverleaf",
-        "title": "LocalLeaf: Push to Overleaf"
+        "title": "LocalLeaf: Push to Overleaf",
+        "icon": "$(cloud-upload)"
       },
       {
         "command": "localleaf.editIgnorePatterns",
-        "title": "LocalLeaf: Edit Ignore Patterns"
+        "title": "LocalLeaf: Edit Ignore Patterns",
+        "icon": "$(list-filter)"
       },
       {
         "command": "localleaf.showSyncStatus",
@@ -83,6 +123,197 @@
       {
         "command": "localleaf.refreshCookie",
         "title": "LocalLeaf: Refresh Cookie"
+      },
+      {
+        "command": "localleaf.openProject",
+        "title": "LocalLeaf: Open Project"
+      },
+      {
+        "command": "localleaf.removeComments",
+        "title": "LocalLeaf: Remove LaTeX Comments",
+        "icon": "$(comment-unresolved)"
+      },
+      {
+        "command": "localleaf.toggleSyncMode",
+        "title": "LocalLeaf: Toggle Sync Mode",
+        "icon": "$(arrow-swap)"
+      },
+      {
+        "command": "localleaf.filterProjects",
+        "title": "LocalLeaf: Filter Projects",
+        "icon": "$(search)"
+      },
+      {
+        "command": "localleaf.sortProjectsByName",
+        "title": "LocalLeaf: Sort Projects by Name"
+      },
+      {
+        "command": "localleaf.sortProjectsByDate",
+        "title": "LocalLeaf: Sort Projects by Date"
+      },
+      {
+        "command": "localleaf.sortProjectsByAccess",
+        "title": "LocalLeaf: Sort Projects by Access Level"
+      },
+      {
+        "command": "localleaf.compileLaTeX",
+        "title": "LocalLeaf: Compile LaTeX",
+        "icon": "$(play)"
+      },
+      {
+        "command": "localleaf.showPdfPreview",
+        "title": "LocalLeaf: Show PDF Preview",
+        "icon": "$(open-preview)"
+      },
+      {
+        "command": "localleaf.selectCompiler",
+        "title": "LocalLeaf: Select Compiler",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "localleaf.toggleAutoCompile",
+        "title": "LocalLeaf: Toggle Auto-Compile"
+      },
+      {
+        "command": "localleaf.cancelCompilation",
+        "title": "LocalLeaf: Cancel Compilation",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "localleaf.resolveConflictRemote",
+        "title": "Resolve Using Remote"
+      },
+      {
+        "command": "localleaf.resolveConflictLocal",
+        "title": "Resolve Using Local"
+      },
+      {
+        "command": "localleaf.viewDiff",
+        "title": "View Diff",
+        "icon": "$(diff)"
+      },
+      {
+        "command": "localleaf.discardChange",
+        "title": "Discard Change",
+        "icon": "$(discard)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "localleaf.pullFromOverleaf",
+          "when": "view == localleaf.mainView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "localleaf.pushToOverleaf",
+          "when": "view == localleaf.mainView",
+          "group": "navigation@2"
+        },
+        {
+          "command": "localleaf.compileLaTeX",
+          "when": "view == localleaf.mainView",
+          "group": "navigation@3"
+        },
+        {
+          "command": "localleaf.showPdfPreview",
+          "when": "view == localleaf.mainView",
+          "group": "navigation@6"
+        },
+        {
+          "command": "localleaf.editIgnorePatterns",
+          "when": "view == localleaf.mainView",
+          "group": "1_actions@1"
+        },
+        {
+          "command": "localleaf.removeComments",
+          "when": "view == localleaf.mainView",
+          "group": "1_actions@2"
+        },
+        {
+          "command": "localleaf.toggleAutoCompile",
+          "when": "view == localleaf.mainView",
+          "group": "1_actions@3"
+        },
+        {
+          "command": "localleaf.selectCompiler",
+          "when": "view == localleaf.mainView",
+          "group": "1_actions@4"
+        },
+        {
+          "command": "localleaf.unlinkFolder",
+          "when": "view == localleaf.mainView",
+          "group": "2_manage@1"
+        },
+        {
+          "command": "localleaf.logout",
+          "when": "view == localleaf.mainView && localleaf.loggedIn",
+          "group": "2_manage@2"
+        },
+        {
+          "command": "localleaf.filterProjects",
+          "when": "view == localleaf.projectsView && localleaf.loggedIn",
+          "group": "navigation@1"
+        },
+        {
+          "command": "localleaf.logout",
+          "when": "view == localleaf.projectsView && localleaf.loggedIn",
+          "group": "2_manage@1"
+        },
+        {
+          "command": "localleaf.sortProjectsByName",
+          "when": "view == localleaf.projectsView && localleaf.loggedIn",
+          "group": "1_sort@1"
+        },
+        {
+          "command": "localleaf.sortProjectsByDate",
+          "when": "view == localleaf.projectsView && localleaf.loggedIn",
+          "group": "1_sort@2"
+        },
+        {
+          "command": "localleaf.sortProjectsByAccess",
+          "when": "view == localleaf.projectsView && localleaf.loggedIn",
+          "group": "1_sort@3"
+        }
+      ],
+      "scm/title": [
+        {
+          "command": "localleaf.pullFromOverleaf",
+          "when": "scmProvider == localleaf && localleaf.isLinked && localleaf.scmActive",
+          "group": "navigation@1"
+        },
+        {
+          "command": "localleaf.pushToOverleaf",
+          "when": "scmProvider == localleaf && localleaf.isLinked && localleaf.scmActive",
+          "group": "navigation@2"
+        }
+      ],
+      "view/item/context": [],
+      "editor/title": [
+        {
+          "command": "localleaf.compileLaTeX",
+          "when": "localleaf.isLinked && resourceExtname == .tex",
+          "group": "navigation@1"
+        },
+        {
+          "command": "localleaf.showPdfPreview",
+          "when": "localleaf.isLinked && resourceExtname == .tex",
+          "group": "navigation@2"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "localleaf.compileLaTeX",
+        "key": "ctrl+alt+b",
+        "mac": "cmd+alt+b",
+        "when": "localleaf.isLinked"
+      },
+      {
+        "command": "localleaf.showPdfPreview",
+        "key": "ctrl+alt+v",
+        "mac": "cmd+alt+v",
+        "when": "localleaf.isLinked"
       }
     ],
     "configuration": {
@@ -97,6 +328,45 @@
           "type": "boolean",
           "default": true,
           "description": "Enable automatic sync when files change"
+        },
+        "localleaf.gitCommitAutoPush": {
+          "type": "boolean",
+          "default": true,
+          "scope": "resource",
+          "description": "Automatically push LocalLeaf manual-mode changes to Overleaf after successful Git commits in VS Code."
+        },
+        "localleaf.syncMode": {
+          "type": "string",
+          "enum": [
+            "manual",
+            "realtime"
+          ],
+          "default": "manual",
+          "description": "Sync mode: 'manual' (pull/push like git) or 'realtime' (auto-sync)"
+        },
+        "localleaf.compiler": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "latexmk",
+            "pdflatex",
+            "xelatex",
+            "lualatex"
+          ],
+          "default": "auto",
+          "description": "LaTeX compiler to use for local compilation"
+        },
+        "localleaf.compileOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically compile LaTeX when saving .tex files"
+        },
+        "localleaf.compileDelay": {
+          "type": "number",
+          "default": 1500,
+          "minimum": 500,
+          "maximum": 10000,
+          "description": "Delay in milliseconds before auto-compiling after save"
         }
       }
     }
@@ -107,7 +377,7 @@
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src --ext ts",
-    "test": "node ./out/test/runTest.js",
+    "test": "node --test test/*.test.js",
     "postinstall": "patch-package",
     "website:dev": "npm run dev --prefix docs/website",
     "website:build": "npm run build --prefix docs/website"
@@ -130,6 +400,7 @@
     "mime-types": "^2.1.35",
     "minimatch": "^9.0.3",
     "node-fetch": "^2.7.0",
+    "pdfjs-dist": "^3.11.174",
     "socket.io-client": "github:overleaf/socket.io-client#0.9.17-overleaf-5"
   }
 }

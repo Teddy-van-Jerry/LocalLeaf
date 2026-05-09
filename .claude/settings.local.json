@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run:*)",
+      "Bash(npx tsc:*)",
+      "Bash(git status:*)",
+      "Bash(npm install:*)",
+      "Bash(where synctex:*)",
+      "Bash(synctex help:*)",
+      "Bash(node:*)",
+      "Bash(reg query:*)",
+      "Bash(cmd:*)",
+      "WebSearch",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:github.com)",
+      "Bash(find E:\\\\Code\\\\Vibe\\\\LocalLeaf\\\\src:*)",
+      "Bash(ls:*)",
+      "Bash(npx:*)",
+      "Bash(code:*)",
+      "Bash(unzip:*)"
+    ]
+  }
+}

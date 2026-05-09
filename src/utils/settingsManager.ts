@@ -17,7 +17,20 @@ export interface ProjectSettings {
     mainTex?: string;
     mainPdf?: string;
     autoSync: boolean;
+    syncMode?: 'manual' | 'realtime';
     lastSynced?: string;
+    compiler?: 'auto' | 'latexmk' | 'pdflatex' | 'xelatex' | 'lualatex';
+    compileOnSave?: boolean;
+}
+
+/**
+ * A linked LocalLeaf project discovered in the current VS Code workspace.
+ */
+export interface DetectedLocalLeafProject {
+    uri: vscode.Uri;
+    workspaceFolder: vscode.Uri;
+    relativePath: string;
+    settings?: ProjectSettings;
 }
 
 /**
@@ -28,6 +41,7 @@ export interface ProjectSettings {
  */
 export class SettingsManager {
     private static instances: Map<string, SettingsManager> = new Map();
+    private static currentWorkspaceFolder?: vscode.Uri;
     private settings?: ProjectSettings;
     private readonly configDir: vscode.Uri;
     private readonly settingsFile: vscode.Uri;
@@ -49,10 +63,120 @@ export class SettingsManager {
     }
 
     /**
+     * Set the LocalLeaf project root used by "current project" commands.
+     * This may be a child folder of the opened VS Code workspace folder.
+     */
+    static setCurrentWorkspaceFolder(workspaceFolder: vscode.Uri | undefined): void {
+        if (workspaceFolder?.scheme === 'file') {
+            SettingsManager.currentWorkspaceFolder = workspaceFolder;
+        } else {
+            SettingsManager.currentWorkspaceFolder = undefined;
+        }
+    }
+
+    /**
+     * Forget the selected LocalLeaf project root.
+     */
+    static clearCurrentWorkspaceFolder(): void {
+        SettingsManager.currentWorkspaceFolder = undefined;
+    }
+
+    /**
+     * Check whether a folder contains LocalLeaf settings.
+     */
+    static async isLinkedFolder(workspaceFolder: vscode.Uri): Promise<boolean> {
+        try {
+            await vscode.workspace.fs.stat(vscode.Uri.joinPath(workspaceFolder, CONFIG_DIR, SETTINGS_FILE));
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    /**
+     * Load project settings for an arbitrary LocalLeaf project folder.
+     */
+    static async loadSettings(workspaceFolder: vscode.Uri): Promise<ProjectSettings | undefined> {
+        try {
+            const content = await vscode.workspace.fs.readFile(
+                vscode.Uri.joinPath(workspaceFolder, CONFIG_DIR, SETTINGS_FILE)
+            );
+            return JSON.parse(new TextDecoder().decode(content));
+        } catch {
+            return undefined;
+        }
+    }
+
+    /**
+     * Find linked LocalLeaf project folders in the opened workspace.
+     *
+     * The scan is intentionally shallow by default: it covers the workspace
+     * folder itself and its direct children, which matches the common
+     * "open a parent folder containing project folders" workflow without
+     * walking large dependency trees.
+     */
+    static async findLinkedProjectFolders(maxDepth: number = 1): Promise<DetectedLocalLeafProject[]> {
+        const workspaceFolders = vscode.workspace.workspaceFolders
+            ?.map(folder => folder.uri)
+            .filter(uri => uri.scheme === 'file') ?? [];
+
+        const results: DetectedLocalLeafProject[] = [];
+        const seen = new Set<string>();
+
+        for (const workspaceFolder of workspaceFolders) {
+            await SettingsManager.collectLinkedProjectFolders(
+                workspaceFolder,
+                workspaceFolder,
+                0,
+                maxDepth,
+                seen,
+                results,
+            );
+        }
+
+        return results.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+    }
+
+    /**
+     * Resolve the current linked project, auto-selecting a direct workspace
+     * folder or the only linked child folder when possible.
+     */
+    static async resolveCurrentInstance(): Promise<SettingsManager | undefined> {
+        if (
+            SettingsManager.currentWorkspaceFolder &&
+            await SettingsManager.isLinkedFolder(SettingsManager.currentWorkspaceFolder)
+        ) {
+            return SettingsManager.getInstance(SettingsManager.currentWorkspaceFolder);
+        }
+
+        SettingsManager.currentWorkspaceFolder = undefined;
+
+        const workspaceFolders = vscode.workspace.workspaceFolders
+            ?.map(folder => folder.uri)
+            .filter(uri => uri.scheme === 'file') ?? [];
+
+        for (const workspaceFolder of workspaceFolders) {
+            if (await SettingsManager.isLinkedFolder(workspaceFolder)) {
+                SettingsManager.setCurrentWorkspaceFolder(workspaceFolder);
+                return SettingsManager.getInstance(workspaceFolder);
+            }
+        }
+
+        const linkedProjects = await SettingsManager.findLinkedProjectFolders();
+        if (linkedProjects.length === 1) {
+            SettingsManager.setCurrentWorkspaceFolder(linkedProjects[0].uri);
+            return SettingsManager.getInstance(linkedProjects[0].uri);
+        }
+
+        return undefined;
+    }
+
+    /**
      * Get instance for the current workspace (first folder)
      */
     static getCurrentInstance(): SettingsManager | undefined {
-        const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri;
+        const workspaceFolder = SettingsManager.currentWorkspaceFolder
+            ?? vscode.workspace.workspaceFolders?.[0]?.uri;
         if (!workspaceFolder || workspaceFolder.scheme !== 'file') {
             return undefined;
         }
@@ -63,26 +187,15 @@ export class SettingsManager {
      * Check if this folder is linked to an Overleaf project
      */
     async isLinked(): Promise<boolean> {
-        try {
-            await vscode.workspace.fs.stat(this.settingsFile);
-            return true;
-        } catch {
-            return false;
-        }
+        return SettingsManager.isLinkedFolder(this.workspaceFolder);
     }
 
     /**
      * Load settings from disk
      */
     async load(): Promise<ProjectSettings | undefined> {
-        try {
-            const content = await vscode.workspace.fs.readFile(this.settingsFile);
-            this.settings = JSON.parse(new TextDecoder().decode(content));
-            return this.settings;
-        } catch {
-            this.settings = undefined;
-            return undefined;
-        }
+        this.settings = await SettingsManager.loadSettings(this.workspaceFolder);
+        return this.settings;
     }
 
     /**
@@ -159,6 +272,7 @@ export class SettingsManager {
             mainTex: 'main.tex',
             mainPdf: 'main.pdf',
             autoSync: true,
+            syncMode: 'manual',
         };
     }
 
@@ -185,6 +299,62 @@ export class SettingsManager {
      */
     async updateLastSynced(): Promise<void> {
         await this.update({ lastSynced: new Date().toISOString() });
+    }
+
+    private static async collectLinkedProjectFolders(
+        uri: vscode.Uri,
+        workspaceFolder: vscode.Uri,
+        depth: number,
+        maxDepth: number,
+        seen: Set<string>,
+        results: DetectedLocalLeafProject[],
+    ): Promise<void> {
+        const key = uri.toString();
+        if (seen.has(key)) {
+            return;
+        }
+        seen.add(key);
+
+        const settings = await SettingsManager.loadSettings(uri);
+        if (settings) {
+            const relativePath = path.relative(workspaceFolder.fsPath, uri.fsPath)
+                .split(path.sep)
+                .join('/') || path.basename(uri.fsPath);
+            results.push({ uri, workspaceFolder, relativePath, settings });
+            return;
+        }
+
+        if (depth >= maxDepth) {
+            return;
+        }
+
+        let entries: [string, vscode.FileType][];
+        try {
+            entries = await vscode.workspace.fs.readDirectory(uri);
+        } catch {
+            return;
+        }
+
+        for (const [name, type] of entries) {
+            if (!SettingsManager.shouldScanChildDirectory(name, type)) {
+                continue;
+            }
+            await SettingsManager.collectLinkedProjectFolders(
+                vscode.Uri.joinPath(uri, name),
+                workspaceFolder,
+                depth + 1,
+                maxDepth,
+                seen,
+                results,
+            );
+        }
+    }
+
+    private static shouldScanChildDirectory(name: string, type: vscode.FileType): boolean {
+        if ((type & vscode.FileType.Directory) === 0) {
+            return false;
+        }
+        return name !== CONFIG_DIR && name !== '.git' && name !== 'node_modules';
     }
 }
 

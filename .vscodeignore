@@ -6,6 +6,7 @@ src/**
 patches/**
 dist/**
 images/*.svg
+!images/icon.svg
 .gitignore
 .vscodeignore
 .eslintrc*

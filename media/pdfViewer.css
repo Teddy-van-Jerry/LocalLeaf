@@ -1,0 +1,216 @@
+/**
+ * LocalLeaf PDF Viewer Styles
+ */
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    background-color: var(--vscode-editor-background);
+    color: var(--vscode-editor-foreground);
+    font-family: var(--vscode-font-family);
+    font-size: var(--vscode-font-size);
+    overflow: hidden;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+
+/* ─── Toolbar ─────────────────────────────────────────────────── */
+
+#toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 12px;
+    background: var(--vscode-titleBar-activeBackground);
+    border-bottom: 1px solid var(--vscode-panel-border);
+    flex-shrink: 0;
+    user-select: none;
+}
+
+#toolbar-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+#toolbar-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+#toolbar button {
+    background: var(--vscode-button-secondaryBackground);
+    color: var(--vscode-button-secondaryForeground);
+    border: none;
+    padding: 4px 8px;
+    cursor: pointer;
+    border-radius: 3px;
+    font-size: 12px;
+    min-width: 28px;
+    text-align: center;
+}
+
+#toolbar button:hover {
+    background: var(--vscode-button-secondaryHoverBackground);
+}
+
+/* ─── Recompile button ────────────────────────────────────────── */
+
+#recompile-btn {
+    background: var(--vscode-button-background) !important;
+    color: var(--vscode-button-foreground) !important;
+    border: none;
+    padding: 4px 12px !important;
+    border-radius: 6px !important;
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: opacity 0.15s;
+}
+
+#recompile-btn:hover {
+    background: var(--vscode-button-hoverBackground) !important;
+}
+
+#recompile-btn.compiling {
+    opacity: 0.7;
+    cursor: default;
+}
+
+#recompile-btn .spinner {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border: 2px solid var(--vscode-button-foreground);
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    vertical-align: middle;
+    margin-right: 6px;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+#toolbar .separator {
+    color: var(--vscode-panel-border);
+    margin: 0 4px;
+}
+
+#page-info,
+#zoom-level {
+    font-size: 12px;
+    color: var(--vscode-descriptionForeground);
+    min-width: 40px;
+    text-align: center;
+}
+
+/* ─── Viewer container ────────────────────────────────────────── */
+
+#viewer-container {
+    flex: 1;
+    overflow: auto;
+    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+#viewer {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+}
+
+/* ─── PDF page (canvas + text layer) ──────────────────────────── */
+
+.pdf-page {
+    position: relative;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+    background: white;
+}
+
+.pdf-page canvas {
+    display: block;
+}
+
+/* ─── Text layer (transparent selectable text over canvas) ────── */
+
+.textLayer {
+    position: absolute;
+    left: 0;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    overflow: hidden;
+    opacity: 0.25;
+    line-height: 1.0;
+    text-size-adjust: none;
+    forced-color-adjust: none;
+    transform-origin: 0 0;
+    z-index: 2;
+}
+
+.textLayer :is(span, br) {
+    color: transparent;
+    position: absolute;
+    white-space: pre;
+    cursor: text;
+    transform-origin: 0% 0%;
+}
+
+.textLayer .markedContent {
+    top: 0;
+    height: 0;
+}
+
+.textLayer ::selection {
+    background: rgba(0, 0, 255, 1);
+}
+
+.textLayer br::selection {
+    background: transparent;
+}
+
+/* ─── Annotation layer (clickable links) ─────────────────────── */
+
+.annotationLayer {
+    position: absolute;
+    left: 0;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    overflow: hidden;
+    z-index: 3;
+    pointer-events: none;
+}
+
+.annotationLayer .pdf-link {
+    position: absolute;
+    display: block;
+    pointer-events: auto;
+    cursor: pointer;
+    border-radius: 2px;
+    transition: background-color 0.15s;
+}
+
+.annotationLayer .pdf-link:hover {
+    background: rgba(26, 115, 232, 0.15);
+}
+
+/* ─── Error state ─────────────────────────────────────────────── */
+
+.error-message {
+    padding: 20px;
+    text-align: center;
+    color: var(--vscode-errorForeground);
+    font-size: 14px;
+}

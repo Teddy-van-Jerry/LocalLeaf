@@ -17,6 +17,7 @@ A VS Code extension for a workaround solution to collaborate on LaTeX documents 
 - **Conflict resolution** with visual diff view
 - **Auto-sync** on file changes
 - **Ignore patterns** support (like `.gitignore`)
+- **Source Control integration** with LocalLeaf pull/push actions
 
 > **Status bar items** showing Overleaf account, sync status, real-time collaboration status.
 > Also shown on the right in this example includes VS Code's error/warning indicators and LaTeX Workshop's build status.
@@ -58,6 +59,15 @@ A VS Code extension for a workaround solution to collaborate on LaTeX documents 
 |---------|---------|-------------|
 | `localleaf.defaultServer` | `https://www.overleaf.com` | Overleaf server URL (for self-hosted instances) |
 | `localleaf.autoSync` | `true` | Automatically sync when files change |
+| `localleaf.gitCommitAutoPush` | `true` | In manual mode, auto-push LocalLeaf changes to Overleaf after successful VS Code Git commits |
+
+## Source Control Integration
+
+- LocalLeaf appears as a lightweight provider in VS Code's **Source Control** tab when the folder is linked.
+- The LocalLeaf provider exposes **Pull from Overleaf** and **Push to Overleaf** actions in SCM.
+- Overleaf file-level local/remote/conflict lists remain in the LocalLeaf **Changes** panel.
+- Git-triggered auto-push is supported for commits made through VS Code's Git integration only.
+- Auto-push runs only in **manual sync mode** and skips when conflicts are detected, then prompts you to resolve via the Changes panel/diff.
 
 ## Philosophy
 

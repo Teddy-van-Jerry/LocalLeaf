@@ -158,6 +158,7 @@ $MAIN_PDF
 *.blg
 *.fdb_latexmk
 *.fls
+*.git
 *.log
 *.out
 *.run.xml

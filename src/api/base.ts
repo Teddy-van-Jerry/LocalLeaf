@@ -422,7 +422,7 @@ export class BaseAPI {
     /**
      * Create a new document (text file)
      */
-    async addDoc(projectId: string, parentFolderId: string, filename: string): Promise<ResponseSchema> {
+    async addDoc(projectId: string, parentFolderId: string, filename: string): Promise<ResponseSchema & { doc?: FileEntity }> {
         if (!this.identity) {
             return { type: 'error', message: 'Not authenticated' };
         }
@@ -446,7 +446,22 @@ export class BaseAPI {
         });
 
         if (res.status === 200) {
-            return { type: 'success' };
+            let doc: FileEntity | undefined;
+            try {
+                const data = await res.json() as any;
+                const rawDoc = data?.doc ?? data;
+                const docId = rawDoc?._id || rawDoc?.id;
+                if (docId) {
+                    doc = {
+                        _id: docId,
+                        _type: 'doc',
+                        name: rawDoc?.name || filename,
+                    };
+                }
+            } catch {
+                // Some deployments may return empty/non-JSON bodies.
+            }
+            return { type: 'success', doc };
         }
         if (res.status === 403 || res.status === 401) {
             return { type: 'error', message: 'Session expired', authError: 'session_expired' };

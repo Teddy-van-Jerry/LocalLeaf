@@ -36,6 +36,7 @@ export const DEFAULT_IGNORE_PATTERNS = [
     '*.blg',
     '*.fdb_latexmk',
     '*.fls',
+    '*.git',
     '*.log',
     '*.out',
     '*.run.xml',
@@ -56,6 +57,7 @@ export const STATUS_BAR_PRIORITY = 100;
 export const COMMANDS = {
     LOGIN: 'localleaf.login',
     LOGOUT: 'localleaf.logout',
+    SHOW_ACCOUNT_PANEL: 'localleaf.showAccountPanel',
     LINK_FOLDER: 'localleaf.linkFolder',
     UNLINK_FOLDER: 'localleaf.unlinkFolder',
     SYNC_NOW: 'localleaf.syncNow',
@@ -68,4 +70,26 @@ export const COMMANDS = {
     JUMP_TO_COLLABORATOR: 'localleaf.jumpToCollaborator',
     VERIFY_CREDENTIALS: 'localleaf.verifyCredentials',
     REFRESH_COOKIE: 'localleaf.refreshCookie',
+    OPEN_PROJECT: 'localleaf.openProject',
+    OPEN_LOCAL_PROJECT: 'localleaf.openLocalProject',
+    REMOVE_COMMENTS: 'localleaf.removeComments',
+    // Sync mode
+    TOGGLE_SYNC_MODE: 'localleaf.toggleSyncMode',
+    // Project sorting & filtering
+    FILTER_PROJECTS: 'localleaf.filterProjects',
+    SORT_PROJECTS_BY_NAME: 'localleaf.sortProjectsByName',
+    SORT_PROJECTS_BY_DATE: 'localleaf.sortProjectsByDate',
+    SORT_PROJECTS_BY_ACCESS: 'localleaf.sortProjectsByAccess',
+    // Compilation & PDF preview
+    COMPILE_LATEX: 'localleaf.compileLaTeX',
+    SHOW_PDF_PREVIEW: 'localleaf.showPdfPreview',
+    SELECT_COMPILER: 'localleaf.selectCompiler',
+    TOGGLE_AUTO_COMPILE: 'localleaf.toggleAutoCompile',
+    CANCEL_COMPILATION: 'localleaf.cancelCompilation',
+    // Changes view context actions
+    RESOLVE_CONFLICT_REMOTE: 'localleaf.resolveConflictRemote',
+    RESOLVE_CONFLICT_LOCAL: 'localleaf.resolveConflictLocal',
+    VIEW_DIFF: 'localleaf.viewDiff',
+    DISCARD_CHANGE: 'localleaf.discardChange',
+    DISCARD_ALL_LOCAL_CHANGES: 'localleaf.discardAllLocalChanges',
 } as const;
