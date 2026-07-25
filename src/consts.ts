@@ -62,6 +62,7 @@ export const COMMANDS = {
     PULL_FROM_OVERLEAF: 'localleaf.pullFromOverleaf',
     PUSH_TO_OVERLEAF: 'localleaf.pushToOverleaf',
     EDIT_IGNORE_PATTERNS: 'localleaf.editIgnorePatterns',
+    CLEAN_IGNORED_REMOTE: 'localleaf.cleanIgnoredRemoteFiles',
     SHOW_SYNC_STATUS: 'localleaf.showSyncStatus',
     SET_MAIN_DOCUMENT: 'localleaf.setMainDocument',
     CONFIGURE: 'localleaf.configure',

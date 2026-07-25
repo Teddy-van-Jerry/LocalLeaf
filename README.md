@@ -48,6 +48,7 @@ A VS Code extension for a workaround solution to collaborate on LaTeX documents 
 | `LocalLeaf: Push to Overleaf` | Upload local changes to Overleaf |
 | `LocalLeaf: Show Sync Status` | Display sync status and options to resync/reconnect |
 | `LocalLeaf: Edit Ignore Patterns` | Configure files to exclude from sync |
+| `LocalLeaf: Clean Ignored Files from Overleaf` | Delete stale remote files matched by `.leafignore`, after confirmation |
 | `LocalLeaf: Set Main Document` | Set the main `.tex` file for compilation |
 | `LocalLeaf: Configure Settings` | Open extension settings |
 | `LocalLeaf: Jump to Collaborator` | Navigate to a collaborator's cursor position |

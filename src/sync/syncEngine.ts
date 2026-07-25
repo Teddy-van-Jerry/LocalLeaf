@@ -100,6 +100,12 @@ function isAuthError(error: unknown): boolean {
            errorStr.includes('unauthorized');
 }
 
+function ensureApiSuccess(result: { type: 'success' | 'error'; message?: string }, action: string): void {
+    if (!result || result.type !== 'success') {
+        throw new Error(`${action}: ${result?.message || 'unknown Overleaf API error'}`);
+    }
+}
+
 /**
  * File entry in the project tree
  */
@@ -128,6 +134,7 @@ export class SyncEngine {
     private disposables: vscode.Disposable[] = [];
     private syncLock: Set<string> = new Set();
     private joinedDocs: Set<string> = new Set();
+    private suppressedRemoteDeletes: Set<string> = new Set();
     private logFn?: (message: string) => void;
 
     readonly onStatusChange = this._onStatusChange.event;
@@ -437,23 +444,16 @@ export class SyncEngine {
      * Check if we should propagate a change (prevent echo)
      */
     private shouldPropagate(action: 'push' | 'pull', path: string, content?: Uint8Array): boolean {
-        const now = Date.now();
         const cache = this.fileCache.get(path);
         const newHash = hashContent(content);
 
-        if (cache) {
-            // Same content, skip
-            if (cache.hash === newHash) {
-                return false;
-            }
-            // Recent change, might be echo
-            if (now - cache.timestamp < DEBOUNCE_DELAY) {
-                this.fileCache.set(path, { hash: newHash, timestamp: now });
-                return false;
-            }
+        // Only identical content is an echo. Editors often emit an empty
+        // create/change event followed immediately by the actual contents.
+        if (cache && cache.hash === newHash) {
+            return false;
         }
 
-        this.fileCache.set(path, { hash: newHash, timestamp: now });
+        this.fileCache.set(path, { hash: newHash, timestamp: Date.now() });
         return true;
     }
 
@@ -483,7 +483,10 @@ export class SyncEngine {
     private async handleLocalFileChange(uri: vscode.Uri): Promise<void> {
         const relativePath = this.getRelativePath(uri);
         if (!this.shouldSync(relativePath)) return;
-        if (!this.acquireLock(relativePath)) return;
+        if (!this.acquireLock(relativePath)) {
+            setTimeout(() => void this.handleLocalFileChange(uri), DEBOUNCE_DELAY);
+            return;
+        }
 
         try {
             // Read file content - may throw if file was deleted between watcher event and now
@@ -511,21 +514,17 @@ export class SyncEngine {
 
             // For documents, we need to use OT updates
             // For binary files, we upload directly
-            if (entry.type === 'doc' && this.socket) {
+            if (entry.type === 'doc') {
+                if (!this.socket) {
+                    throw new Error(`Cannot update ${relativePath}: real-time connection is unavailable`);
+                }
                 const pushed = await this.pushDocumentChanges(entry.id, relativePath, content);
                 if (pushed) {
                     this.log(`Pushed to Overleaf: ${relativePath}`);
                 }
             } else {
-                // Upload binary file
-                const projectSettings = this.settings.getSettings()!;
-                await this.api.uploadFile(
-                    projectSettings.projectId,
-                    entry.parentId!,
-                    entry.name,
-                    content
-                );
-                this.log(`Uploaded to Overleaf: ${relativePath}`);
+                await this.replaceRemoteFile(entry, content);
+                this.log(`Replaced on Overleaf: ${relativePath}`);
             }
 
             this.baseContent.set(relativePath, content);
@@ -604,6 +603,134 @@ export class SyncEngine {
         return ops;
     }
 
+    private async refreshProjectFileTree(): Promise<void> {
+        const projectSettings = this.settings.getSettings()!;
+        const result = await this.api.getProjectDetails(projectSettings.projectId);
+        ensureApiSuccess(result, 'Refresh project file tree');
+
+        if (!result.projectData?.rootFolder) {
+            throw new Error('Refresh project file tree: Overleaf returned no folder tree');
+        }
+
+        this.project = {
+            ...(this.project || {}),
+            _id: result.projectData.projectId || projectSettings.projectId,
+            name: result.projectData.projectName || this.project?.name || 'Unknown',
+            rootDoc_id: result.projectData.rootDocId || this.project?.rootDoc_id,
+            rootFolder: result.projectData.rootFolder,
+        } as ProjectEntity;
+        this.buildFileTree(this.project);
+    }
+
+    private trackUploadedEntity(
+        result: { file?: FileEntity },
+        parentId: string,
+        name: string,
+        path: string
+    ): FileTreeEntry | undefined {
+        if (!result.file?._id) {
+            return undefined;
+        }
+
+        const entry: FileTreeEntry = {
+            id: result.file._id,
+            type: result.file._type || 'file',
+            name: result.file.name || name,
+            path,
+            parentId,
+        };
+        this.fileTree.set(entry.id, entry);
+        this.fileTreeByPath.set(path, entry);
+        debugLog('Tracked uploaded file:', path, entry.id);
+        return entry;
+    }
+
+    private async createTextDocumentWithContent(
+        projectId: string,
+        parentId: string,
+        relativePath: string,
+        name: string,
+        content: Uint8Array
+    ): Promise<void> {
+        // Set this before creating the document so its socket acknowledgement
+        // is recognized as an echo of the local operation.
+        this.baseContent.set(relativePath, content);
+        const result = await this.api.addDoc(projectId, parentId, name);
+        ensureApiSuccess(result, `Create ${relativePath}`);
+
+        let entry: FileTreeEntry | undefined;
+        if (result.doc?._id) {
+            entry = {
+                id: result.doc._id,
+                type: 'doc',
+                name: result.doc.name || name,
+                path: relativePath,
+                parentId,
+            };
+            this.fileTree.set(entry.id, entry);
+            this.fileTreeByPath.set(relativePath, entry);
+        } else {
+            await this.refreshProjectFileTree();
+            entry = this.fileTreeByPath.get(relativePath);
+        }
+
+        if (!entry || entry.type !== 'doc') {
+            throw new Error(`Create ${relativePath}: new document was not returned by Overleaf`);
+        }
+        if (!this.socket) {
+            throw new Error(`Create ${relativePath}: real-time connection is required to write document content`);
+        }
+
+        await this.pushDocumentChanges(entry.id, relativePath, content);
+    }
+
+    private async deleteRemoteEntry(entry: FileTreeEntry, preserveLocal = false): Promise<void> {
+        const projectSettings = this.settings.getSettings()!;
+        if (preserveLocal) {
+            this.suppressedRemoteDeletes.add(entry.id);
+        }
+
+        const result = await this.api.deleteEntity(projectSettings.projectId, entry.type, entry.id);
+        try {
+            ensureApiSuccess(result, `Delete ${entry.path}`);
+        } catch (error) {
+            this.suppressedRemoteDeletes.delete(entry.id);
+            throw error;
+        }
+
+        this.fileTree.delete(entry.id);
+        if (this.fileTreeByPath.get(entry.path)?.id === entry.id) {
+            this.fileTreeByPath.delete(entry.path);
+        }
+        if (!preserveLocal) {
+            this.baseContent.delete(entry.path);
+            this.fileCache.delete(entry.path);
+        }
+    }
+
+    private async replaceRemoteFile(entry: FileTreeEntry, content: Uint8Array): Promise<void> {
+        if (!entry.parentId) {
+            throw new Error(`Replace ${entry.path}: parent folder is unknown`);
+        }
+
+        const projectSettings = this.settings.getSettings()!;
+        this.baseContent.set(entry.path, content);
+        await this.deleteRemoteEntry(entry, true);
+
+        const result = await this.api.uploadFile(
+            projectSettings.projectId,
+            entry.parentId,
+            entry.name,
+            content
+        );
+        ensureApiSuccess(result, `Upload ${entry.path}`);
+
+        if (!this.trackUploadedEntity(result, entry.parentId, entry.name, entry.path)) {
+            await this.refreshProjectFileTree();
+        }
+        this.fileCache.set(entry.path, { hash: hashContent(content), timestamp: Date.now() });
+    }
+
     /**
      * Handle local file creation
      */
@@ -636,6 +763,7 @@ export class SyncEngine {
             if (stat.type === vscode.FileType.Directory) {
                 const folderPath = relativePath + '/';
                 const result = await this.api.addFolder(projectSettings.projectId, parentId, name);
+                ensureApiSuccess(result, `Create folder ${folderPath}`);
 
                 // Add folder to file tree immediately (don't wait for socket event)
                 if (result.type === 'success' && result.folder) {
@@ -670,9 +798,27 @@ export class SyncEngine {
                 const isTextFile = this.isTextFile(name);
 
                 if (isTextFile) {
-                    await this.api.addDoc(projectSettings.projectId, parentId, name);
+                    await this.createTextDocumentWithContent(
+                        projectSettings.projectId,
+                        parentId,
+                        relativePath,
+                        name,
+                        content
+                    );
                 } else {
-                    await this.api.uploadFile(projectSettings.projectId, parentId, name, content);
+                    // Set this before upload so the socket acknowledgement is
+                    // recognized as an echo of the local operation.
+                    this.baseContent.set(relativePath, content);
+                    const result = await this.api.uploadFile(
+                        projectSettings.projectId,
+                        parentId,
+                        name,
+                        content
+                    );
+                    ensureApiSuccess(result, `Upload ${relativePath}`);
+                    if (!this.trackUploadedEntity(result, parentId, name, relativePath)) {
+                        await this.refreshProjectFileTree();
+                    }
                 }
 
                 this.baseContent.set(relativePath, content);
@@ -701,7 +847,10 @@ export class SyncEngine {
     private async handleLocalFileDelete(uri: vscode.Uri): Promise<void> {
         const relativePath = this.getRelativePath(uri);
         if (!this.shouldSync(relativePath)) return;
-        if (!this.acquireLock(relativePath)) return;
+        if (!this.acquireLock(relativePath)) {
+            setTimeout(() => void this.handleLocalFileDelete(uri), DEBOUNCE_DELAY);
+            return;
+        }
 
         try {
             // Try both file path and folder path (with trailing slash)
@@ -715,6 +864,19 @@ export class SyncEngine {
                     pathToUse = folderPath;
                 }
             }
+            if (!entry) {
+                // Socket events can be missed while reconnecting. Refresh the
+                // server tree before deciding there is nothing to delete.
+                await this.refreshProjectFileTree();
+                entry = this.fileTreeByPath.get(relativePath);
+                if (!entry) {
+                    const folderPath = relativePath + '/';
+                    entry = this.fileTreeByPath.get(folderPath);
+                    if (entry) {
+                        pathToUse = folderPath;
+                    }
+                }
+            }
             if (!entry) return;
 
             // Only delete from Overleaf if the file was previously synced locally.
@@ -726,13 +888,9 @@ export class SyncEngine {
                 return;
             }
 
-            const projectSettings = this.settings.getSettings()!;
             this.setStatus('pushing', `Deleting ${pathToUse}`, pathToUse);
 
-            await this.api.deleteEntity(projectSettings.projectId, entry.type, entry.id);
-
-            this.fileTree.delete(entry.id);
-            this.fileTreeByPath.delete(pathToUse);
+            await this.deleteRemoteEntry(entry, true);
             this.baseContent.delete(pathToUse);
             this.fileCache.delete(pathToUse);
 
@@ -757,22 +915,29 @@ export class SyncEngine {
         const parentPath = parent?.path || '/';
         const path = type === 'folder' ? parentPath + entity.name + '/' : parentPath + entity.name;
 
+        // Record the remote identity before taking the path lock. Local
+        // uploads hold this lock while Overleaf emits the create event.
+        const entry: FileTreeEntry = {
+            id: entity._id,
+            type,
+            name: entity.name,
+            path,
+            parentId,
+        };
+        this.fileTree.set(entity._id, entry);
+        this.fileTreeByPath.set(path, entry);
+
         if (!this.shouldSync(path)) return;
-        if (!this.acquireLock(path)) return;
+        if (!this.acquireLock(path)) {
+            setTimeout(
+                () => void this.handleRemoteFileCreated(parentId, type, entity),
+                DEBOUNCE_DELAY
+            );
+            return;
+        }
 
         try {
             this.setStatus('pulling', `Downloading ${path}`, path);
-
-            // Add to tree
-            const entry: FileTreeEntry = {
-                id: entity._id,
-                type,
-                name: entity.name,
-                path,
-                parentId,
-            };
-            this.fileTree.set(entity._id, entry);
-            this.fileTreeByPath.set(path, entry);
 
             const localUri = this.settings.getFilePath(path);
 
@@ -893,6 +1058,17 @@ export class SyncEngine {
      * Handle remote file removed
      */
     private async handleRemoteFileRemoved(entityId: string): Promise<void> {
+        if (this.suppressedRemoteDeletes.delete(entityId)) {
+            const suppressedEntry = this.fileTree.get(entityId);
+            if (suppressedEntry) {
+                this.fileTree.delete(entityId);
+                if (this.fileTreeByPath.get(suppressedEntry.path)?.id === entityId) {
+                    this.fileTreeByPath.delete(suppressedEntry.path);
+                }
+            }
+            return;
+        }
+
         const entry = this.fileTree.get(entityId);
         if (!entry) return;
 
@@ -1401,15 +1577,83 @@ export class SyncEngine {
         this.setStatus('pushing', `Uploading ${relativePath}`, relativePath);
 
         if (isTextFile) {
-            await this.api.addDoc(projectSettings.projectId, parentId, name);
-            // Note: addDoc creates an empty doc, we need to push content after
-            // The file tree will be updated via socket events
+            await this.createTextDocumentWithContent(
+                projectSettings.projectId,
+                parentId,
+                relativePath,
+                name,
+                content
+            );
         } else {
-            await this.api.uploadFile(projectSettings.projectId, parentId, name, content);
+            this.baseContent.set(relativePath, content);
+            const result = await this.api.uploadFile(
+                projectSettings.projectId,
+                parentId,
+                name,
+                content
+            );
+            ensureApiSuccess(result, `Upload ${relativePath}`);
+            if (!this.trackUploadedEntity(result, parentId, name, relativePath)) {
+                await this.refreshProjectFileTree();
+            }
         }
 
         this.baseContent.set(relativePath, content);
         this.fileCache.set(relativePath, { hash: hashContent(content), timestamp: Date.now() });
+    }
+
+    /**
+     * Return remote files currently excluded by .leafignore.
+     * Refreshing both sources also finds artifacts left by earlier sessions.
+     */
+    async getIgnoredRemoteFiles(): Promise<string[]> {
+        await this.ignoreParser.load();
+        await this.refreshProjectFileTree();
+
+        return Array.from(this.fileTree.values())
+            .filter(entry => entry.type !== 'folder' && this.ignoreParser.shouldIgnore(entry.path))
+            .map(entry => entry.path)
+            .sort((a, b) => a.localeCompare(b));
+    }
+
+    /**
+     * Delete a user-confirmed list of ignored remote files.
+     * Every path is revalidated immediately before deletion.
+     */
+    async deleteIgnoredRemoteFiles(
+        paths: readonly string[]
+    ): Promise<{ deleted: number; failed: Array<{ path: string; error: unknown }> }> {
+        await this.ignoreParser.load();
+        await this.refreshProjectFileTree();
+
+        let deleted = 0;
+        const failed: Array<{ path: string; error: unknown }> = [];
+        this.setStatus('pushing', 'Cleaning ignored files from Overleaf...');
+
+        for (const path of paths) {
+            const entry = this.fileTreeByPath.get(path);
+            if (!entry || entry.type === 'folder' || !this.ignoreParser.shouldIgnore(path)) {
+                continue;
+            }
+
+            try {
+                await this.deleteRemoteEntry(entry, true);
+                this.baseContent.delete(path);
+                this.fileCache.delete(path);
+                this.log(`Deleted ignored file from Overleaf: ${path}`);
+                deleted++;
+            } catch (error) {
+                failed.push({ path, error });
+            }
+        }
+
+        if (failed.length > 0) {
+            this.setStatus('error', `Cleanup completed with ${failed.length} failure(s)`);
+        } else {
+            this.setStatus('idle', `Deleted ${deleted} ignored file(s) from Overleaf`);
+        }
+
+        return { deleted, failed };
     }
 
     /**
@@ -1517,15 +1761,13 @@ export class SyncEngine {
                             this.setStatus('pushing', `Uploading ${entry.path}`, entry.path);
                             const localContent = await vscode.workspace.fs.readFile(localUri);
 
-                            if (entry.type === 'doc' && this.socket) {
+                            if (entry.type === 'doc') {
+                                if (!this.socket) {
+                                    throw new Error(`Cannot update ${entry.path}: real-time connection is unavailable`);
+                                }
                                 await this.pushDocumentChanges(entry.id, entry.path, localContent);
                             } else {
-                                await this.api.uploadFile(
-                                    projectSettings.projectId,
-                                    entry.parentId!,
-                                    entry.name,
-                                    localContent
-                                );
+                                await this.replaceRemoteFile(entry, localContent);
                             }
 
                             this.baseContent.set(entry.path, localContent);

@@ -52,6 +52,9 @@ export interface ResponseSchema {
     projects?: ProjectInfo[];
     project?: ProjectEntity;
     content?: Uint8Array;
+    file?: FileEntity;
+    doc?: FileEntity;
+    folder?: FileEntity;
 }
 
 export class BaseAPI {
@@ -410,8 +413,28 @@ export class BaseAPI {
             }
         );
 
-        if (res.status === 200) {
-            return { type: 'success' };
+        if (res.ok) {
+            let uploadData: any;
+            try {
+                uploadData = await res.json();
+            } catch {
+                // Some Overleaf versions return an empty successful response.
+            }
+
+            const rawEntity = uploadData?.file || uploadData?.entity || uploadData;
+            const entityId = rawEntity?._id || rawEntity?.id || uploadData?.entity_id;
+            const rawEntityType = rawEntity?._type || rawEntity?.type || uploadData?.entity_type;
+            const entityType: FileEntity['_type'] =
+                rawEntityType === 'doc' || rawEntityType === 'folder' ? rawEntityType : 'file';
+            const file: FileEntity | undefined = entityId
+                ? {
+                    _id: entityId,
+                    _type: entityType,
+                    name: rawEntity?.name || filename,
+                }
+                : undefined;
+
+            return { type: 'success', file };
         }
         if (res.status === 403 || res.status === 401) {
             return { type: 'error', message: 'Session expired', authError: 'session_expired' };
@@ -445,8 +468,24 @@ export class BaseAPI {
             }),
         });
 
-        if (res.status === 200) {
-            return { type: 'success' };
+        if (res.ok) {
+            let doc: FileEntity | undefined;
+            try {
+                const data = await res.json() as any;
+                const rawDoc = data?.doc || data;
+                const docId = rawDoc?._id || rawDoc?.id;
+                if (docId) {
+                    doc = {
+                        _id: docId,
+                        _type: 'doc',
+                        name: rawDoc?.name || filename,
+                    };
+                }
+            } catch {
+                // Some Overleaf versions return an empty successful response.
+            }
+
+            return { type: 'success', doc };
         }
         if (res.status === 403 || res.status === 401) {
             return { type: 'error', message: 'Session expired', authError: 'session_expired' };
