@@ -135,6 +135,7 @@ export class SyncEngine {
     private syncLock: Set<string> = new Set();
     private joinedDocs: Set<string> = new Set();
     private suppressedRemoteDeletes: Set<string> = new Set();
+    private suppressedRemoteRenames: Map<string, Set<string>> = new Map();
     private logFn?: (message: string) => void;
 
     readonly onStatusChange = this._onStatusChange.event;
@@ -475,6 +476,23 @@ export class SyncEngine {
         this.syncLock.delete(path);
     }
 
+    private suppressRemoteRename(entityId: string, newName: string): void {
+        const names = this.suppressedRemoteRenames.get(entityId) || new Set<string>();
+        names.add(newName);
+        this.suppressedRemoteRenames.set(entityId, names);
+    }
+
+    private consumeSuppressedRemoteRename(entityId: string, newName: string): boolean {
+        const names = this.suppressedRemoteRenames.get(entityId);
+        if (!names?.delete(newName)) {
+            return false;
+        }
+        if (names.size === 0) {
+            this.suppressedRemoteRenames.delete(entityId);
+        }
+        return true;
+    }
+
     // === Local change handlers ===
 
     /**
@@ -699,6 +717,7 @@ export class SyncEngine {
         }
 
         this.fileTree.delete(entry.id);
+        this.suppressedRemoteRenames.delete(entry.id);
         if (this.fileTreeByPath.get(entry.path)?.id === entry.id) {
             this.fileTreeByPath.delete(entry.path);
         }
@@ -708,27 +727,96 @@ export class SyncEngine {
         }
     }
 
+    private async renameRemoteEntry(entry: FileTreeEntry, name: string, action: string): Promise<void> {
+        const projectSettings = this.settings.getSettings()!;
+        this.suppressRemoteRename(entry.id, name);
+        try {
+            const result = await this.api.renameEntity(
+                projectSettings.projectId,
+                entry.type,
+                entry.id,
+                name
+            );
+            ensureApiSuccess(result, action);
+        } catch (error) {
+            this.consumeSuppressedRemoteRename(entry.id, name);
+            throw error;
+        }
+    }
+
     private async replaceRemoteFile(entry: FileTreeEntry, content: Uint8Array): Promise<void> {
         if (!entry.parentId) {
             throw new Error(`Replace ${entry.path}: parent folder is unknown`);
         }
 
         const projectSettings = this.settings.getSettings()!;
+        const previousContent = this.baseContent.get(entry.path);
+        const suffix = `.localleaf-${entry.id.slice(-12)}-${Date.now().toString(36)}`;
+        const temporaryName = `${entry.name.slice(0, Math.max(1, 150 - suffix.length))}${suffix}`;
+        let renamedOriginal = false;
+        let uploadedReplacement = false;
+
         this.baseContent.set(entry.path, content);
-        await this.deleteRemoteEntry(entry, true);
+        try {
+            // Overleaf rejects duplicate names. Move the original aside first,
+            // then keep it as a rollback copy until the replacement is tracked.
+            await this.renameRemoteEntry(
+                entry,
+                temporaryName,
+                `Prepare replacement for ${entry.path}`
+            );
+            renamedOriginal = true;
 
-        const result = await this.api.uploadFile(
-            projectSettings.projectId,
-            entry.parentId,
-            entry.name,
-            content
-        );
-        ensureApiSuccess(result, `Upload ${entry.path}`);
+            const result = await this.api.uploadFile(
+                projectSettings.projectId,
+                entry.parentId,
+                entry.name,
+                content
+            );
+            ensureApiSuccess(result, `Upload ${entry.path}`);
+            uploadedReplacement = true;
 
-        if (!this.trackUploadedEntity(result, entry.parentId, entry.name, entry.path)) {
-            await this.refreshProjectFileTree();
+            if (!this.trackUploadedEntity(result, entry.parentId, entry.name, entry.path)) {
+                await this.refreshProjectFileTree();
+            }
+
+            const originalEntry = this.fileTree.get(entry.id) || entry;
+            await this.deleteRemoteEntry(originalEntry, true);
+            this.fileCache.set(entry.path, { hash: hashContent(content), timestamp: Date.now() });
+        } catch (error) {
+            if (renamedOriginal && !uploadedReplacement) {
+                try {
+                    await this.renameRemoteEntry(
+                        entry,
+                        entry.name,
+                        `Restore ${entry.path} after failed replacement`
+                    );
+                } catch (restoreError) {
+                    const replacementMessage = error instanceof Error ? error.message : String(error);
+                    const restoreMessage = restoreError instanceof Error
+                        ? restoreError.message
+                        : String(restoreError);
+                    if (previousContent !== undefined) {
+                        this.baseContent.set(entry.path, previousContent);
+                    } else {
+                        this.baseContent.delete(entry.path);
+                    }
+                    throw new Error(
+                        `${replacementMessage}; the original file remains on Overleaf under ` +
+                        `${temporaryName} because restoring its name failed: ${restoreMessage}`
+                    );
+                }
+            }
+
+            if (!uploadedReplacement) {
+                if (previousContent !== undefined) {
+                    this.baseContent.set(entry.path, previousContent);
+                } else {
+                    this.baseContent.delete(entry.path);
+                }
+            }
+            throw error;
         }
-        this.fileCache.set(entry.path, { hash: hashContent(content), timestamp: Date.now() });
     }
 
     /**
@@ -737,7 +825,10 @@ export class SyncEngine {
     private async handleLocalFileCreate(uri: vscode.Uri): Promise<void> {
         const relativePath = this.getRelativePath(uri);
         if (!this.shouldSync(relativePath)) return;
-        if (!this.acquireLock(relativePath)) return;
+        if (!this.acquireLock(relativePath)) {
+            setTimeout(() => void this.handleLocalFileCreate(uri), DEBOUNCE_DELAY);
+            return;
+        }
 
         try {
             // Stat the file - may throw if file was deleted between watcher event and now
@@ -750,6 +841,19 @@ export class SyncEngine {
                     return;
                 }
                 throw statError;
+            }
+
+            const trackedPath = stat.type === vscode.FileType.Directory
+                ? relativePath + '/'
+                : relativePath;
+            if (this.fileTreeByPath.has(trackedPath)) {
+                // A create event can be the local echo of a remote write or an
+                // editor's atomic replacement of an existing file. Folders
+                // already exist remotely; files are re-evaluated as changes.
+                if (stat.type !== vscode.FileType.Directory) {
+                    setTimeout(() => void this.handleLocalFileChange(uri), DEBOUNCE_DELAY);
+                }
+                return;
             }
 
             const projectSettings = this.settings.getSettings()!;
@@ -1011,6 +1115,10 @@ export class SyncEngine {
      * Handle remote file renamed
      */
     private async handleRemoteFileRenamed(entityId: string, newName: string): Promise<void> {
+        if (this.consumeSuppressedRemoteRename(entityId, newName)) {
+            return;
+        }
+
         const entry = this.fileTree.get(entityId);
         if (!entry) return;
 

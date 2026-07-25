@@ -166,33 +166,103 @@ async function run(): Promise<void> {
     binaryReplacement.settings = {
         getSettings: () => ({ projectId: 'project' }),
     };
+    const replacementOperations: string[] = [];
     binaryReplacement.api = {
-        uploadFile: async () => ({
-            type: 'success',
-            file: { _id: 'new-binary-id', _type: 'file', name: 'figure.pdf' },
-        }),
+        renameEntity: async (
+            _projectId: string,
+            _type: string,
+            _id: string,
+            name: string
+        ) => {
+            replacementOperations.push(`rename:${name}`);
+            return { type: 'success' };
+        },
+        uploadFile: async (
+            _projectId: string,
+            _parentId: string,
+            name: string
+        ) => {
+            replacementOperations.push(`upload:${name}`);
+            return {
+                type: 'success',
+                file: { _id: 'new-binary-id', _type: 'file', name: 'figure.pdf' },
+            };
+        },
     };
-    binaryReplacement.fileTree = new Map();
-    binaryReplacement.fileTreeByPath = new Map();
+    const oldBinary = {
+        id: 'old-binary-id',
+        type: 'file',
+        name: 'figure.pdf',
+        path: '/figure.pdf',
+        parentId: 'folder',
+    };
+    binaryReplacement.fileTree = new Map([[oldBinary.id, oldBinary]]);
+    binaryReplacement.fileTreeByPath = new Map([[oldBinary.path, oldBinary]]);
     binaryReplacement.baseContent = new Map();
     binaryReplacement.fileCache = new Map();
-    binaryReplacement.deleteRemoteEntry = async () => undefined;
+    binaryReplacement.suppressedRemoteRenames = new Map();
+    binaryReplacement.deleteRemoteEntry = async (entry: { id: string }) => {
+        replacementOperations.push(`delete:${entry.id}`);
+    };
     binaryReplacement.refreshProjectFileTree = async () => {
         throw new Error('upload response should make a tree refresh unnecessary');
     };
     await binaryReplacement.replaceRemoteFile(
-        {
-            id: 'old-binary-id',
-            type: 'file',
-            name: 'figure.pdf',
-            path: '/figure.pdf',
-            parentId: 'folder',
-        },
+        oldBinary,
         Uint8Array.from([9, 8, 7])
     );
     assert.equal(
         binaryReplacement.fileTreeByPath.get('/figure.pdf').id,
         'new-binary-id'
+    );
+    assert.equal(replacementOperations[0].startsWith('rename:figure.pdf.localleaf-'), true);
+    assert.deepStrictEqual(replacementOperations.slice(1), [
+        'upload:figure.pdf',
+        'delete:old-binary-id',
+    ]);
+
+    const failedReplacement = Object.create(SyncEngine.prototype) as any;
+    failedReplacement.settings = {
+        getSettings: () => ({ projectId: 'project' }),
+    };
+    const failedRenameTargets: string[] = [];
+    failedReplacement.api = {
+        renameEntity: async (
+            _projectId: string,
+            _type: string,
+            _id: string,
+            name: string
+        ) => {
+            failedRenameTargets.push(name);
+            return { type: 'success' };
+        },
+        uploadFile: async () => ({
+            type: 'error',
+            message: 'simulated upload failure',
+        }),
+    };
+    failedReplacement.fileTree = new Map([[oldBinary.id, oldBinary]]);
+    failedReplacement.fileTreeByPath = new Map([[oldBinary.path, oldBinary]]);
+    const oldBinaryContent = Uint8Array.from([1, 2, 3]);
+    failedReplacement.baseContent = new Map([[oldBinary.path, oldBinaryContent]]);
+    failedReplacement.fileCache = new Map();
+    failedReplacement.suppressedRemoteRenames = new Map();
+    failedReplacement.deleteRemoteEntry = async () => {
+        throw new Error('the original must not be deleted after a failed upload');
+    };
+    await assert.rejects(
+        () => failedReplacement.replaceRemoteFile(
+            oldBinary,
+            Uint8Array.from([9, 8, 7])
+        ),
+        /simulated upload failure/
+    );
+    assert.equal(failedRenameTargets.length, 2);
+    assert.equal(failedRenameTargets[0].startsWith('figure.pdf.localleaf-'), true);
+    assert.equal(failedRenameTargets[1], 'figure.pdf');
+    assert.deepStrictEqual(
+        failedReplacement.baseContent.get('/figure.pdf'),
+        oldBinaryContent
     );
 
     const acknowledgement = Object.create(SyncEngine.prototype) as any;
@@ -216,6 +286,19 @@ async function run(): Promise<void> {
     global.setTimeout = originalSetTimeout;
     assert.equal(acknowledgement.fileTreeByPath.get('/photo.jpg').id, 'socket-id-1');
     assert.equal(retryScheduled, true);
+
+    const localCreate = Object.create(SyncEngine.prototype) as any;
+    localCreate.getRelativePath = () => '/new.tex';
+    localCreate.shouldSync = () => true;
+    localCreate.acquireLock = () => false;
+    retryScheduled = false;
+    global.setTimeout = (() => {
+        retryScheduled = true;
+        return 1;
+    }) as unknown as typeof setTimeout;
+    await localCreate.handleLocalFileCreate({});
+    global.setTimeout = originalSetTimeout;
+    assert.equal(retryScheduled, true, 'locked local create events must be retried');
 
     const cleanup = Object.create(SyncEngine.prototype) as any;
     const ignored = {

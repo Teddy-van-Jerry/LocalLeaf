@@ -31,6 +31,10 @@ let outputChannel: vscode.OutputChannel;
 let statusUpdateInterval: NodeJS.Timeout | undefined;
 let authState: AuthState = 'none';
 
+function errorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+}
+
 /**
  * Extension activation
  */
@@ -753,7 +757,7 @@ async function cmdCleanIgnoredRemoteFiles() {
             );
         }
     } catch (error) {
-        vscode.window.showErrorMessage(`LocalLeaf: Cleanup failed - ${error}`);
+        vscode.window.showErrorMessage(`LocalLeaf: Cleanup failed - ${errorMessage(error)}`);
     }
 }
 
