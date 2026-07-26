@@ -61,6 +61,10 @@
         "title": "LocalLeaf: Edit Ignore Patterns"
       },
       {
+        "command": "localleaf.cleanIgnoredRemoteFiles",
+        "title": "LocalLeaf: Clean Ignored Files from Overleaf"
+      },
+      {
         "command": "localleaf.showSyncStatus",
         "title": "LocalLeaf: Show Sync Status"
       },

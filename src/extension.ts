@@ -31,6 +31,10 @@ let outputChannel: vscode.OutputChannel;
 let statusUpdateInterval: NodeJS.Timeout | undefined;
 let authState: AuthState = 'none';
 
+function errorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+}
+
 /**
  * Extension activation
  */
@@ -115,6 +119,7 @@ function registerCommands(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand(COMMANDS.PULL_FROM_OVERLEAF, cmdPullFromOverleaf),
         vscode.commands.registerCommand(COMMANDS.PUSH_TO_OVERLEAF, cmdPushToOverleaf),
         vscode.commands.registerCommand(COMMANDS.EDIT_IGNORE_PATTERNS, cmdEditIgnorePatterns),
+        vscode.commands.registerCommand(COMMANDS.CLEAN_IGNORED_REMOTE, cmdCleanIgnoredRemoteFiles),
         vscode.commands.registerCommand(COMMANDS.SHOW_SYNC_STATUS, cmdShowSyncStatus),
         vscode.commands.registerCommand(COMMANDS.SET_MAIN_DOCUMENT, cmdSetMainDocument),
         vscode.commands.registerCommand(COMMANDS.CONFIGURE, cmdConfigure),
@@ -699,6 +704,61 @@ async function cmdEditIgnorePatterns() {
     }
 
     await vscode.window.showTextDocument(ignoreFile);
+}
+
+/**
+ * Remove stale remote files only after they match the current .leafignore
+ * rules and the user explicitly confirms the operation.
+ */
+async function cmdCleanIgnoredRemoteFiles() {
+    if (!syncEngine) {
+        vscode.window.showWarningMessage('LocalLeaf: Not connected. Please link a folder first.');
+        return;
+    }
+
+    try {
+        const paths = await syncEngine.getIgnoredRemoteFiles();
+        if (paths.length === 0) {
+            vscode.window.showInformationMessage('LocalLeaf: No ignored files exist on Overleaf.');
+            return;
+        }
+
+        const visiblePaths = paths.slice(0, 12);
+        const remaining = paths.length - visiblePaths.length;
+        const preview = visiblePaths.join('\n') +
+            (remaining > 0 ? `\n... and ${remaining} more` : '');
+        const choice = await vscode.window.showWarningMessage(
+            `Delete ${paths.length} ignored file(s) from Overleaf?\n\n${preview}`,
+            { modal: true },
+            'Delete Ignored Files'
+        );
+        if (choice !== 'Delete Ignored Files') {
+            return;
+        }
+
+        const result = await vscode.window.withProgress({
+            location: vscode.ProgressLocation.Notification,
+            title: 'LocalLeaf: Cleaning ignored files from Overleaf...',
+            cancellable: false,
+        }, () => syncEngine!.deleteIgnoredRemoteFiles(paths));
+
+        if (result.failed.length > 0) {
+            const failedPreview = result.failed
+                .slice(0, 5)
+                .map(item => item.path)
+                .join(', ');
+            vscode.window.showWarningMessage(
+                `LocalLeaf: Deleted ${result.deleted} ignored file(s); ` +
+                `${result.failed.length} failed: ${failedPreview}`
+            );
+        } else {
+            vscode.window.showInformationMessage(
+                `LocalLeaf: Deleted ${result.deleted} ignored file(s) from Overleaf.`
+            );
+        }
+    } catch (error) {
+        vscode.window.showErrorMessage(`LocalLeaf: Cleanup failed - ${errorMessage(error)}`);
+    }
 }
 
 /**
