@@ -20,6 +20,20 @@ export interface ProjectSettings {
     lastSynced?: string;
 }
 
+export type StoredProjectSettings = Omit<ProjectSettings, 'autoSync'> & { autoSync?: boolean };
+
+export function isValidProjectSettings(value: unknown): value is StoredProjectSettings {
+    if (!value || typeof value !== 'object') return false;
+    const candidate = value as Partial<StoredProjectSettings>;
+    return typeof candidate.serverUrl === 'string' && candidate.serverUrl.trim().length > 0
+        && typeof candidate.projectId === 'string' && candidate.projectId.trim().length > 0
+        && typeof candidate.projectName === 'string' && candidate.projectName.trim().length > 0
+        && (candidate.mainTex === undefined || typeof candidate.mainTex === 'string')
+        && (candidate.mainPdf === undefined || typeof candidate.mainPdf === 'string')
+        && (candidate.autoSync === undefined || typeof candidate.autoSync === 'boolean')
+        && (candidate.lastSynced === undefined || typeof candidate.lastSynced === 'string');
+}
+
 /**
  * Settings Manager - handles local project configuration
  *
@@ -64,8 +78,8 @@ export class SettingsManager {
      */
     async isLinked(): Promise<boolean> {
         try {
-            await vscode.workspace.fs.stat(this.settingsFile);
-            return true;
+            const content = await vscode.workspace.fs.readFile(this.settingsFile);
+            return isValidProjectSettings(JSON.parse(new TextDecoder().decode(content)));
         } catch {
             return false;
         }
@@ -77,7 +91,12 @@ export class SettingsManager {
     async load(): Promise<ProjectSettings | undefined> {
         try {
             const content = await vscode.workspace.fs.readFile(this.settingsFile);
-            this.settings = JSON.parse(new TextDecoder().decode(content));
+            const parsed: unknown = JSON.parse(new TextDecoder().decode(content));
+            if (!isValidProjectSettings(parsed)) {
+                this.settings = undefined;
+                return undefined;
+            }
+            this.settings = { ...parsed, autoSync: parsed.autoSync ?? true };
             return this.settings;
         } catch {
             this.settings = undefined;
@@ -156,8 +175,6 @@ export class SettingsManager {
             serverUrl: serverUrl || DEFAULT_SERVER,
             projectId,
             projectName,
-            mainTex: 'main.tex',
-            mainPdf: 'main.pdf',
             autoSync: true,
         };
     }

@@ -57,22 +57,22 @@ export class IgnoreParser {
      * Resolve variables like $MAIN_TEX and $MAIN_PDF
      */
     private resolveVariables(): void {
-        this.resolvedPatterns = this.patterns.map(pattern => {
+        this.resolvedPatterns = this.patterns.flatMap(pattern => {
             let resolved = pattern;
 
             // Resolve $MAIN_TEX
             if (resolved.includes(VAR_MAIN_TEX)) {
-                const mainTex = this.settings?.mainTex || 'main.tex';
-                resolved = resolved.replace(VAR_MAIN_TEX, mainTex);
+                if (!this.settings?.mainTex) return [];
+                resolved = resolved.replace(VAR_MAIN_TEX, this.settings.mainTex);
             }
 
             // Resolve $MAIN_PDF
             if (resolved.includes(VAR_MAIN_PDF)) {
-                const mainPdf = this.settings?.mainPdf || 'main.pdf';
-                resolved = resolved.replace(VAR_MAIN_PDF, mainPdf);
+                if (!this.settings?.mainPdf) return [];
+                resolved = resolved.replace(VAR_MAIN_PDF, this.settings.mainPdf);
             }
 
-            return resolved;
+            return [resolved];
         });
     }
 
