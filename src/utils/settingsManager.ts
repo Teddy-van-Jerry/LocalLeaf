@@ -6,6 +6,8 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { CONFIG_DIR, SETTINGS_FILE, DEFAULT_SERVER, IGNORE_FILE } from '../consts';
+import { assertSafeWorkspacePath, isFileNotFoundError, normalizeProjectPath } from './pathSafety';
+import { isSupportedServerUrl, validateServerUrl } from './serverUrl';
 
 /**
  * Project settings stored in .localleaf/settings.json
@@ -42,14 +44,31 @@ export interface DetectedLocalLeafProject {
     settings: ProjectSettings;
 }
 
+function isValidOptionalProjectFile(value: unknown, extension: string): boolean {
+    if (value === undefined) return true;
+    if (typeof value !== 'string' || value.length === 0 || value.length > 4096) return false;
+    try {
+        const normalized = normalizeProjectPath(value, false);
+        return !normalized.endsWith('/') && normalized.toLowerCase().endsWith(extension);
+    } catch {
+        return false;
+    }
+}
+
 export function isValidProjectSettings(value: unknown): value is StoredProjectSettings {
     if (!value || typeof value !== 'object') return false;
     const candidate = value as Partial<StoredProjectSettings>;
-    return typeof candidate.serverUrl === 'string' && candidate.serverUrl.trim().length > 0
-        && typeof candidate.projectId === 'string' && candidate.projectId.trim().length > 0
-        && typeof candidate.projectName === 'string' && candidate.projectName.trim().length > 0
-        && (candidate.mainTex === undefined || typeof candidate.mainTex === 'string')
-        && (candidate.mainPdf === undefined || typeof candidate.mainPdf === 'string')
+    return isSupportedServerUrl(candidate.serverUrl)
+        && typeof candidate.projectId === 'string'
+        && candidate.projectId.trim().length > 0
+        && candidate.projectId.length <= 1024
+        && !candidate.projectId.includes('\0')
+        && typeof candidate.projectName === 'string'
+        && candidate.projectName.trim().length > 0
+        && candidate.projectName.length <= 4096
+        && !candidate.projectName.includes('\0')
+        && isValidOptionalProjectFile(candidate.mainTex, '.tex')
+        && isValidOptionalProjectFile(candidate.mainPdf, '.pdf')
         && (candidate.autoSync === undefined || typeof candidate.autoSync === 'boolean')
         && (candidate.lastSynced === undefined || typeof candidate.lastSynced === 'string');
 }
@@ -124,12 +143,18 @@ export class SettingsManager {
 
     static async loadSettings(workspaceFolder: vscode.Uri): Promise<ProjectSettings | undefined> {
         try {
+            const settingsFile = vscode.Uri.joinPath(workspaceFolder, CONFIG_DIR, SETTINGS_FILE);
+            await assertSafeWorkspacePath(workspaceFolder, settingsFile);
             const content = await vscode.workspace.fs.readFile(
-                vscode.Uri.joinPath(workspaceFolder, CONFIG_DIR, SETTINGS_FILE),
+                settingsFile,
             );
             const parsed: unknown = JSON.parse(new TextDecoder().decode(content));
             if (!isValidProjectSettings(parsed)) return undefined;
-            return { ...parsed, autoSync: parsed.autoSync ?? true };
+            return {
+                ...parsed,
+                serverUrl: validateServerUrl(parsed.serverUrl).url,
+                autoSync: parsed.autoSync ?? true,
+            };
         } catch {
             return undefined;
         }
@@ -186,8 +211,11 @@ export class SettingsManager {
      * Get instance for the current workspace (first folder)
      */
     static getCurrentInstance(): SettingsManager | undefined {
+        const fileFolders = vscode.workspace.workspaceFolders
+            ?.map(folder => folder.uri)
+            .filter(uri => uri.scheme === 'file') ?? [];
         const workspaceFolder = SettingsManager.currentWorkspaceFolder
-            ?? vscode.workspace.workspaceFolders?.[0]?.uri;
+            ?? (fileFolders.length === 1 ? fileFolders[0] : undefined);
         if (!workspaceFolder || workspaceFolder.scheme !== 'file') {
             return undefined;
         }
@@ -213,17 +241,22 @@ export class SettingsManager {
      * Save settings to disk
      */
     async save(settings: ProjectSettings): Promise<void> {
-        // Ensure config directory exists
-        try {
-            await vscode.workspace.fs.createDirectory(this.configDir);
-        } catch {
-            // Directory may already exist
+        const canonicalSettings: ProjectSettings = {
+            ...settings,
+            serverUrl: validateServerUrl(settings.serverUrl).url,
+        };
+        if (!isValidProjectSettings(canonicalSettings)) {
+            throw new Error('Refusing to save invalid LocalLeaf project settings.');
         }
 
-        this.settings = settings;
-        SettingsManager.setCurrentWorkspaceFolder(this.workspaceFolder);
-        const content = new TextEncoder().encode(JSON.stringify(settings, null, 2));
+        await assertSafeWorkspacePath(this.workspaceFolder, this.configDir);
+        await vscode.workspace.fs.createDirectory(this.configDir);
+
+        await assertSafeWorkspacePath(this.workspaceFolder, this.settingsFile);
+        const content = new TextEncoder().encode(JSON.stringify(canonicalSettings, null, 2));
         await vscode.workspace.fs.writeFile(this.settingsFile, content);
+        this.settings = canonicalSettings;
+        SettingsManager.setCurrentWorkspaceFolder(this.workspaceFolder);
     }
 
     /**
@@ -241,10 +274,12 @@ export class SettingsManager {
      */
     async delete(): Promise<void> {
         try {
+            await assertSafeWorkspacePath(this.workspaceFolder, this.configDir);
             await vscode.workspace.fs.delete(this.configDir, { recursive: true });
             this.settings = undefined;
-        } catch {
-            // Ignore errors
+        } catch (error) {
+            if (!isFileNotFoundError(error)) throw error;
+            this.settings = undefined;
         }
     }
 
@@ -278,7 +313,7 @@ export class SettingsManager {
         projectName: string
     ): ProjectSettings {
         return {
-            serverUrl: serverUrl || DEFAULT_SERVER,
+            serverUrl: validateServerUrl(serverUrl || DEFAULT_SERVER).url,
             projectId,
             projectName,
             autoSync: true,
@@ -289,18 +324,30 @@ export class SettingsManager {
      * Get the path to a relative file in the workspace
      */
     getFilePath(relativePath: string): vscode.Uri {
-        return vscode.Uri.joinPath(this.workspaceFolder, relativePath);
+        const canonicalPath = normalizeProjectPath(relativePath, false);
+        const candidate = vscode.Uri.joinPath(this.workspaceFolder, canonicalPath.slice(1));
+        const workspacePath = this.workspaceFolder.path.replace(/\/+$/, '');
+        const candidatePath = candidate.path.replace(/\/+$/, '');
+        const isContained = candidate.scheme === this.workspaceFolder.scheme
+            && candidate.authority === this.workspaceFolder.authority
+            && candidatePath.startsWith(`${workspacePath}/`);
+        if (!isContained) {
+            throw new Error(`Refusing to access a path outside the LocalLeaf workspace: ${relativePath}`);
+        }
+        return candidate;
     }
 
     /**
      * Convert an absolute URI to a relative path
      */
     getRelativePath(uri: vscode.Uri): string | undefined {
-        const workspacePath = this.workspaceFolder.path;
-        if (uri.path.startsWith(workspacePath)) {
-            return uri.path.slice(workspacePath.length);
+        if (uri.scheme !== this.workspaceFolder.scheme || uri.authority !== this.workspaceFolder.authority) {
+            return undefined;
         }
-        return undefined;
+        const workspacePath = this.workspaceFolder.path.replace(/\/+$/, '');
+        if (uri.path === workspacePath) return '/';
+        if (!uri.path.startsWith(`${workspacePath}/`)) return undefined;
+        return normalizeProjectPath(uri.path.slice(workspacePath.length));
     }
 
     /**
@@ -352,6 +399,7 @@ export class SettingsManager {
 
     private static shouldScanChildDirectory(name: string, type: vscode.FileType): boolean {
         return (type & vscode.FileType.Directory) !== 0
+            && (type & vscode.FileType.SymbolicLink) === 0
             && name !== CONFIG_DIR
             && name !== '.git'
             && name !== 'node_modules';

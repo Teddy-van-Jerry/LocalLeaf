@@ -71,7 +71,10 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
             localResourceRoots: [vscode.Uri.joinPath(this.extensionUri, 'images')],
         };
         webviewView.webview.onDidReceiveMessage((message: unknown) => {
-            void this.handleMessage(message);
+            void this.handleMessage(message).catch(error => {
+                console.error('[LocalLeaf] Projects view action failed:', error);
+                void vscode.window.showErrorMessage(`LocalLeaf: ${error instanceof Error ? error.message : String(error)}`);
+            });
         });
         webviewView.webview.html = this.getHtml(webviewView.webview);
     }
@@ -149,7 +152,12 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
         try {
             const api = new BaseAPI(credential.serverUrl);
             api.setIdentity(credential.identity);
-            const result = await api.getProjects();
+            let result: Awaited<ReturnType<BaseAPI['getProjects']>>;
+            try {
+                result = await api.getProjects();
+            } finally {
+                api.dispose();
+            }
             if (version !== this.refreshVersion) return;
 
             if (result.type !== 'success' || !result.projects) {
@@ -186,7 +194,9 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
 
     private updateState(state: ProjectsViewState): void {
         this.state = state;
-        void this.view?.webview.postMessage({ type: 'state', state });
+        void this.view?.webview.postMessage({ type: 'state', state }).then(undefined, error => {
+            console.error('[LocalLeaf] Failed to update Projects view:', error);
+        });
     }
 
     private async handleMessage(raw: unknown): Promise<void> {

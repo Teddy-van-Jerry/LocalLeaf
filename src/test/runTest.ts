@@ -73,19 +73,28 @@ async function verifyWebSocketCompatibility(): Promise<void> {
 let fetchResponse: {
     ok: boolean;
     status: number;
+    statusText?: string;
     json: () => Promise<unknown>;
     text: () => Promise<string>;
+    buffer?: () => Promise<Buffer>;
+    headers?: {
+        get(name: string): string | null;
+        raw?(): Record<string, string[]>;
+    };
+    body?: { once(event: string, listener: () => void): void; resume?(): void };
 } = {
     ok: true,
     status: 200,
     json: async () => ({ entity_id: 'binary-id-1', entity_type: 'file' }),
     text: async () => '',
 };
+let fetchImplementation = async (_url?: unknown, _options?: unknown): Promise<typeof fetchResponse> => fetchResponse;
 
 let executeCommandImpl: (...args: unknown[]) => Promise<unknown> = async () => undefined;
 
 interface MockUri {
     scheme: string;
+    authority?: string;
     path: string;
     fsPath: string;
     toString(): string;
@@ -156,6 +165,7 @@ const mockWorkspaceFs = {
 class MockEventEmitter {
     readonly event = () => undefined;
     fire(): void {}
+    dispose(): void {}
 }
 
 class MockFileSystemError extends Error {
@@ -167,7 +177,7 @@ Module._load = function (request: string, parent: unknown, isMain: boolean): unk
         return {
             EventEmitter: MockEventEmitter,
             FileSystemError: MockFileSystemError,
-            FileType: { File: 1, Directory: 2 },
+            FileType: { File: 1, Directory: 2, SymbolicLink: 64 },
             Uri: {
                 joinPath: (
                     base: MockUri | string,
@@ -175,6 +185,12 @@ Module._load = function (request: string, parent: unknown, isMain: boolean): unk
                 ): MockUri | string => typeof base === 'string'
                     ? [base, ...segments].join('/')
                     : mockFileUri(path.win32.join(base.fsPath, ...segments)),
+                from: (components: { scheme: string; path: string }): MockUri => ({
+                    scheme: components.scheme,
+                    path: components.path,
+                    fsPath: components.path,
+                    toString: () => `${components.scheme}:${components.path}`,
+                }),
             },
             commands: {
                 executeCommand: (...args: unknown[]) => executeCommandImpl(...args),
@@ -202,7 +218,7 @@ Module._load = function (request: string, parent: unknown, isMain: boolean): unk
     if (request === 'node-fetch') {
         return {
             __esModule: true,
-            default: async () => fetchResponse,
+            default: (url?: unknown, options?: unknown) => fetchImplementation(url, options),
         };
     }
     return originalLoad(request, parent, isMain);
@@ -212,6 +228,7 @@ async function run(): Promise<void> {
     const { BaseAPI } = require(path.join('..', 'api', 'base')) as {
         BaseAPI: new (url: string) => {
             setIdentity(identity: unknown): void;
+            dispose(): void;
             uploadFile(
                 projectId: string,
                 folderId: string,
@@ -219,6 +236,7 @@ async function run(): Promise<void> {
                 content: Uint8Array
             ): Promise<unknown>;
             addDoc(projectId: string, folderId: string, filename: string): Promise<unknown>;
+            getFile(projectId: string, fileId: string): Promise<unknown>;
         };
     };
     const { SyncEngine } = require(path.join('..', 'sync', 'syncEngine')) as {
@@ -258,22 +276,109 @@ async function run(): Promise<void> {
         _type: 'doc',
         name: 'chapter.tex',
     });
+    await assert.rejects(
+        () => api.addDoc('project', 'folder', '../outside.tex'),
+        /Unsafe Overleaf entity name/,
+        'entity names must be validated again at the HTTP boundary',
+    );
+    await assert.rejects(
+        () => (api as any).deleteEntity('project', '../../logout', 'entity'),
+        /entity type/,
+    );
+
+    const rangeHeaders: Array<string | undefined> = [];
+    const downloadUrls: string[] = [];
+    const partialResponses = [
+        { range: 'bytes 0-1/4', bytes: [1, 2] },
+        { range: 'bytes 2-3/4', bytes: [3, 4] },
+    ];
+    fetchImplementation = async (url, options) => {
+        downloadUrls.push(String(url));
+        const request = options as { headers?: Record<string, string> };
+        rangeHeaders.push(request.headers?.Range);
+        const partial = partialResponses.shift();
+        assert.ok(partial, 'partial download requested too many chunks');
+        return {
+            ok: true,
+            status: 206,
+            json: async () => ({}),
+            text: async () => '',
+            buffer: async () => Buffer.from(partial.bytes),
+            headers: { get: name => name.toLowerCase() === 'content-range' ? partial.range : null },
+        };
+    };
+    const partialDownload = await api.getFile('project/../../other', 'partial?file') as {
+        type: string;
+        content?: Uint8Array;
+    };
+    assert.equal(partialDownload.type, 'success');
+    assert.deepStrictEqual([...partialDownload.content!], [1, 2, 3, 4]);
+    assert.deepStrictEqual(rangeHeaders, [undefined, 'bytes=2-']);
+    assert.ok(
+        downloadUrls.every(url => url.includes('project/project%2F..%2F..%2Fother/file/partial%3Ffile')),
+        'opaque IDs must remain encoded inside their URL segments',
+    );
+
+    fetchImplementation = async () => ({
+        ok: false,
+        status: 403,
+        statusText: 'Forbidden',
+        json: async () => ({}),
+        text: async () => 'Forbidden',
+        buffer: async () => Buffer.alloc(0),
+        headers: { get: () => null },
+    });
+    const deniedDownload = await api.getFile('project', 'denied-file') as {
+        type: string;
+        authError?: string;
+        content?: Uint8Array;
+    };
+    assert.equal(deniedDownload.type, 'error');
+    assert.equal(deniedDownload.authError, 'session_expired');
+    assert.equal(deniedDownload.content, undefined, 'HTTP errors must never become empty successful files');
+    fetchImplementation = async () => fetchResponse;
+    api.dispose();
 
     const propagation = Object.create(SyncEngine.prototype) as any;
     propagation.fileCache = new Map();
     assert.equal(
-        propagation.shouldPropagate('push', '/chapter.tex', Uint8Array.from([1])),
+        propagation.shouldPropagate('/chapter.tex', Uint8Array.from([1])),
         true
     );
     assert.equal(
-        propagation.shouldPropagate('push', '/chapter.tex', Uint8Array.from([2])),
+        propagation.shouldPropagate('/chapter.tex', Uint8Array.from([2])),
         true,
         'different content inside the debounce window must not be discarded'
     );
     assert.equal(
-        propagation.shouldPropagate('push', '/chapter.tex', Uint8Array.from([2])),
+        propagation.shouldPropagate('/chapter.tex', Uint8Array.from([2])),
         false,
         'identical content should still be treated as an echo'
+    );
+    assert.equal(
+        propagation.shouldPropagate('/binary.dat', Uint8Array.from([0xff])),
+        true,
+    );
+    assert.equal(
+        propagation.shouldPropagate('/binary.dat', Uint8Array.from([0xfe])),
+        true,
+        'different invalid UTF-8 byte sequences must not collide in the synchronization cache',
+    );
+
+    assert.deepEqual(
+        propagation.calculateOps('hello world', 'hello brave world'),
+        [{ p: 6, i: 'brave ' }],
+        'OT updates should insert only the changed range',
+    );
+    assert.deepEqual(
+        propagation.calculateOps('abcXYZdef', 'abc123def'),
+        [{ p: 3, d: 'XYZ' }, { p: 3, i: '123' }],
+        'OT updates should retain the common prefix and suffix',
+    );
+    assert.deepEqual(
+        propagation.calculateOps('unchanged', 'unchanged'),
+        [],
+        'unchanged documents should not generate operations',
     );
 
     const textCreation = Object.create(SyncEngine.prototype) as any;
@@ -414,40 +519,180 @@ async function run(): Promise<void> {
         oldBinaryContent
     );
 
+    const folderRebase = Object.create(SyncEngine.prototype) as any;
+    const folderEntry = { id: 'folder', type: 'folder', name: 'old', path: '/old/' };
+    const childEntry = { id: 'child', type: 'doc', name: 'child.tex', path: '/old/child.tex' };
+    const nestedEntry = { id: 'nested', type: 'file', name: 'image.png', path: '/old/assets/image.png' };
+    folderRebase.fileTree = new Map([
+        [folderEntry.id, folderEntry],
+        [childEntry.id, childEntry],
+        [nestedEntry.id, nestedEntry],
+    ]);
+    folderRebase.fileTreeByPath = new Map([
+        [folderEntry.path, folderEntry],
+        [childEntry.path, childEntry],
+        [nestedEntry.path, nestedEntry],
+    ]);
+    folderRebase.baseContent = new Map([[childEntry.path, Uint8Array.from([1])]]);
+    folderRebase.fileCache = new Map([[nestedEntry.path, 'hash']]);
+    folderRebase.rebaseFileTree('/old/', '/renamed/');
+    assert.equal(childEntry.path, '/renamed/child.tex');
+    assert.equal(nestedEntry.path, '/renamed/assets/image.png');
+    assert.ok(folderRebase.fileTreeByPath.has('/renamed/child.tex'));
+    assert.ok(folderRebase.baseContent.has('/renamed/child.tex'));
+    assert.ok(folderRebase.fileCache.has('/renamed/assets/image.png'));
+    assert.equal(folderRebase.fileTreeByPath.has('/old/child.tex'), false);
+
+    const subtreeRemoval = Object.create(SyncEngine.prototype) as any;
+    const subtreeFolder = { id: 'folder', type: 'folder', name: 'folder', path: '/folder/' };
+    const subtreeChild = { id: 'child', type: 'doc', name: 'child.tex', path: '/folder/child.tex' };
+    subtreeRemoval.fileTree = new Map([['folder', subtreeFolder], ['child', subtreeChild]]);
+    subtreeRemoval.fileTreeByPath = new Map([
+        ['/folder/', subtreeFolder],
+        ['/folder/child.tex', subtreeChild],
+    ]);
+    subtreeRemoval.baseContent = new Map([
+        ['/folder/', new Uint8Array()],
+        ['/folder/child.tex', Uint8Array.from([1])],
+    ]);
+    subtreeRemoval.fileCache = new Map([['/folder/child.tex', 'hash']]);
+    subtreeRemoval.joinedDocs = new Set(['child']);
+    subtreeRemoval.removeTrackedSubtree('/folder/');
+    assert.equal(subtreeRemoval.fileTree.size, 0, 'folder removal must clear every descendant identity');
+    assert.equal(subtreeRemoval.fileTreeByPath.size, 0);
+    assert.equal(subtreeRemoval.baseContent.size, 0);
+    assert.equal(subtreeRemoval.fileCache.size, 0);
+    assert.equal(subtreeRemoval.joinedDocs.size, 0);
+
     const acknowledgement = Object.create(SyncEngine.prototype) as any;
     acknowledgement.fileTree = new Map([
         ['root', { id: 'root', type: 'folder', path: '/' }],
     ]);
     acknowledgement.fileTreeByPath = new Map();
     acknowledgement.shouldSync = () => true;
-    acknowledgement.acquireLock = () => false;
-    const originalSetTimeout = global.setTimeout;
-    let retryScheduled = false;
-    global.setTimeout = (() => {
-        retryScheduled = true;
-        return 1;
-    }) as unknown as typeof setTimeout;
+    acknowledgement.acquireLockWhenAvailable = async () => false;
     await acknowledgement.handleRemoteFileCreated(
         'root',
         'file',
         { _id: 'socket-id-1', name: 'photo.jpg' }
     );
-    global.setTimeout = originalSetTimeout;
     assert.equal(acknowledgement.fileTreeByPath.get('/photo.jpg').id, 'socket-id-1');
-    assert.equal(retryScheduled, true);
 
     const localCreate = Object.create(SyncEngine.prototype) as any;
+    localCreate.disposed = false;
     localCreate.getRelativePath = () => '/new.tex';
     localCreate.shouldSync = () => true;
-    localCreate.acquireLock = () => false;
-    retryScheduled = false;
-    global.setTimeout = (() => {
-        retryScheduled = true;
-        return 1;
-    }) as unknown as typeof setTimeout;
+    let waitedForLock = false;
+    localCreate.acquireLockWhenAvailable = async () => {
+        waitedForLock = true;
+        return false;
+    };
     await localCreate.handleLocalFileCreate({});
-    global.setTimeout = originalSetTimeout;
-    assert.equal(retryScheduled, true, 'locked local create events must be retried');
+    assert.equal(waitedForLock, true, 'locked local create events must wait instead of being discarded');
+
+    const orderedRemoteEvents = Object.create(SyncEngine.prototype) as any;
+    orderedRemoteEvents.disposed = false;
+    orderedRemoteEvents.remoteEventQueue = Promise.resolve();
+    const eventOrder: string[] = [];
+    let releaseFirstEvent: (() => void) | undefined;
+    orderedRemoteEvents.enqueueRemoteEvent(async () => {
+        eventOrder.push('first-start');
+        await new Promise<void>(resolve => { releaseFirstEvent = resolve; });
+        eventOrder.push('first-end');
+    });
+    orderedRemoteEvents.enqueueRemoteEvent(async () => { eventOrder.push('second'); });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepStrictEqual(eventOrder, ['first-start']);
+    releaseFirstEvent?.();
+    await orderedRemoteEvents.remoteEventQueue;
+    assert.deepStrictEqual(eventOrder, ['first-start', 'first-end', 'second']);
+
+    const ownDocumentEcho = Object.create(SyncEngine.prototype) as any;
+    ownDocumentEcho.socket = { publicId: 'this-client' };
+    ownDocumentEcho.suppressedRemoteDocumentUpdates = new Map();
+    ownDocumentEcho.fileTree = new Map();
+    await ownDocumentEcho.handleRemoteFileChanged({
+        doc: 'doc',
+        v: 1,
+        op: [{ p: 0, i: 'content' }],
+        meta: { source: 'this-client', ts: Date.now(), user_id: 'user' },
+    });
+
+    const remoteOt = Object.create(SyncEngine.prototype) as any;
+    const remoteOtUri = mockFileUri('D:\\ot-workspace\\chapter.tex');
+    resetMockWorkspace([mockFileUri('D:\\ot-workspace')], [
+        ['D:\\ot-workspace', { type: 2 }],
+        ['D:\\ot-workspace\\chapter.tex', { type: 1, content: 'local edit' }],
+    ]);
+    remoteOt.disposed = false;
+    remoteOt.socket = { publicId: 'this-client' };
+    remoteOt.suppressedRemoteDocumentUpdates = new Map();
+    remoteOt.fileTree = new Map([[
+        'doc',
+        { id: 'doc', type: 'doc', name: 'chapter.tex', path: '/chapter.tex' },
+    ]]);
+    remoteOt.baseContent = new Map([[
+        '/chapter.tex',
+        new TextEncoder().encode('server'),
+    ]]);
+    remoteOt.fileCache = new Map();
+    remoteOt.settings = {
+        getFilePath: () => remoteOtUri,
+        getSettings: () => ({ projectId: 'project' }),
+    };
+    remoteOt.api = {};
+    remoteOt.shouldSync = () => true;
+    remoteOt.acquireLockWhenAvailable = async () => true;
+    remoteOt.releaseLock = () => undefined;
+    remoteOt.assertNoSymbolicLinks = async () => undefined;
+    remoteOt.askConflictResolution = async () => 'skip';
+    remoteOt.setStatus = () => undefined;
+    await remoteOt.handleRemoteFileChanged({
+        doc: 'doc',
+        v: 2,
+        op: [{ p: 6, i: '!' }],
+        meta: { source: 'other-client', ts: Date.now(), user_id: 'other' },
+    });
+    assert.equal(
+        new TextDecoder().decode(remoteOt.baseContent.get('/chapter.tex')),
+        'server!',
+        'remote operations must be applied to the known server base, not an unsaved local edit',
+    );
+
+    const protectedPaths = Object.create(SyncEngine.prototype) as any;
+    protectedPaths.ignoreParser = { shouldIgnore: () => false };
+    assert.equal(protectedPaths.shouldSync('/.git/config'), false);
+    assert.equal(protectedPaths.shouldSync('/.vscode/settings.json'), false);
+    assert.equal(protectedPaths.shouldSync('/.localleaf/settings.json'), false);
+    assert.equal(protectedPaths.shouldSync('/chapter.tex'), true);
+
+    const cancellableLock = Object.create(SyncEngine.prototype) as any;
+    cancellableLock.disposed = false;
+    cancellableLock.syncLock = new Set(['/busy.tex']);
+    cancellableLock.pendingWaits = new Map();
+    cancellableLock.disposables = [];
+    cancellableLock.api = { dispose: () => undefined };
+    cancellableLock._onStatusChange = new MockEventEmitter();
+    cancellableLock.suppressedRemoteDeletes = new Set();
+    cancellableLock.suppressedRemoteRenames = new Map();
+    cancellableLock.suppressedRemoteDocumentUpdates = new Map();
+    cancellableLock.remoteDiffContents = new Map();
+    cancellableLock.fileTree = new Map();
+    cancellableLock.fileTreeByPath = new Map();
+    cancellableLock.fileCache = new Map();
+    cancellableLock.baseContent = new Map();
+    cancellableLock.joinedDocs = new Set();
+    const pendingLock = cancellableLock.acquireLockWhenAvailable('/busy.tex');
+    cancellableLock.disconnect();
+    assert.equal(await pendingLock, false, 'disconnect must cancel lock waits immediately');
+
+    const rootDeletion = Object.create(SyncEngine.prototype) as any;
+    rootDeletion.suppressedRemoteDeletes = new Set();
+    rootDeletion.fileTree = new Map([['root', { id: 'root', type: 'folder', path: '/' }]]);
+    await assert.rejects(
+        () => rootDeletion.handleRemoteFileRemoved('root'),
+        /project root/,
+    );
 
     const cleanup = Object.create(SyncEngine.prototype) as any;
     const ignored = {
@@ -685,15 +930,22 @@ async function run(): Promise<void> {
     const cookieLoginStart = extensionSource.indexOf('async function loginWithCookies');
     const cookieLoginEnd = extensionSource.indexOf('// === Command Implementations ===', cookieLoginStart);
     const cookieLoginSource = extensionSource.slice(cookieLoginStart, cookieLoginEnd);
-    const insecureWarning = cookieLoginSource.indexOf('showWarningMessage');
+    const insecureWarning = extensionSource.indexOf('async function confirmInsecureServer');
     const cookieApiCreation = cookieLoginSource.indexOf('new BaseAPI');
     assert.ok(cookieLoginStart >= 0 && cookieLoginEnd > cookieLoginStart);
-    assert.match(cookieLoginSource, /parsed\.protocol === 'http:'/);
-    assert.match(cookieLoginSource, /modal:\s*true/);
-    assert.ok(insecureWarning >= 0 && insecureWarning < cookieApiCreation,
+    assert.match(cookieLoginSource, /validateServerUrl\(serverUrl\)/);
+    assert.match(cookieLoginSource, /await confirmInsecureServer/);
+    assert.match(extensionSource.slice(insecureWarning, cookieLoginStart), /modal:\s*true/);
+    assert.ok(insecureWarning >= 0 && cookieApiCreation >= 0,
         'HTTP cookie login must require a modal warning before any API request');
     assert.match(extensionSource, /if \(await loginWithCookies[\s\S]*await reconnectAfterLogin\(\)/,
         'cancelling the HTTP warning must also skip reconnecting');
+    assert.doesNotMatch(extensionSource, /serverUrl\.includes\(['"]overleaf\.com/,
+        'official Overleaf detection must use the parsed hostname, not a substring');
+    assert.match(extensionSource, /async function cmdRefreshCookie[\s\S]*loginWithCookies\(serverUrl, cookies\)/,
+        'cookie refresh must use the same URL and HTTP safety policy as login');
+    assert.match(extensionSource, /handleWorkspaceFoldersChanged[\s\S]*disposeCurrentSyncSession\(\)[\s\S]*initializeSync/,
+        'workspace-folder changes must replace the active synchronization session');
 
     const projectsSource = fs.readFileSync(
         path.join(__dirname, '..', '..', 'src', 'views', 'projectsWebviewProvider.ts'),
@@ -726,11 +978,61 @@ async function run(): Promise<void> {
     assert.match(firstNonce, /^[0-9a-f]{32}$/);
     assert.notEqual(firstNonce, secondNonce, 'CSP nonces must use cryptographic randomness');
 
+    const { assertSafeWorkspacePath, isFileNotFoundError, joinProjectPath, normalizeProjectPath } = require(
+        path.join('..', 'utils', 'pathSafety')
+    ) as {
+        assertSafeWorkspacePath(workspace: MockUri, target: MockUri): Promise<void>;
+        isFileNotFoundError(error: unknown): boolean;
+        joinProjectPath(parent: string, name: string, folder: boolean): string;
+        normalizeProjectPath(candidate: string, allowRoot?: boolean): string;
+    };
+    assert.equal(joinProjectPath('/chapters/', 'intro.tex', false), '/chapters/intro.tex');
+    assert.throws(() => joinProjectPath('/', '../outside.tex', false), /Unsafe Overleaf entity name/);
+    assert.throws(() => normalizeProjectPath('/../../outside.tex', false), /Unsafe Overleaf entity name/);
+    assert.throws(() => normalizeProjectPath('/safe\\..\\outside.tex', false), /Unsafe Overleaf project path/);
+    assert.throws(() => normalizeProjectPath('/', false), /workspace root/);
+    assert.throws(() => joinProjectPath('/', 'settings.json.', false), /Unsafe Overleaf entity name/);
+    assert.throws(() => joinProjectPath('/', 'CON', false), /Unsafe Overleaf entity name/);
+    const safetyRoot = mockFileUri('D:\\safety-workspace');
+    const linkedTarget = mockFileUri('D:\\safety-workspace\\linked\\secret.tex');
+    resetMockWorkspace([safetyRoot], [
+        ['D:\\safety-workspace', { type: 2 }],
+        ['D:\\safety-workspace\\linked', { type: 66 }],
+    ]);
+    await assert.rejects(
+        () => assertSafeWorkspacePath(safetyRoot, linkedTarget),
+        /symbolic link/,
+        'existing symbolic-link ancestors must never be traversed',
+    );
+    await assert.rejects(
+        () => assertSafeWorkspacePath(safetyRoot, mockFileUri('D:\\outside\\secret.tex')),
+        /outside the workspace/,
+    );
+    assert.equal(isFileNotFoundError(new Error('ENOENT: missing file')), true);
+    assert.equal(
+        isFileNotFoundError(new MockFileSystemError('Access denied')),
+        false,
+        'filesystem errors without a missing-path signal must not bypass path safety checks',
+    );
+
+    const { validateServerUrl } = require(path.join('..', 'utils', 'serverUrl')) as {
+        validateServerUrl(candidate: string): { url: string; isOfficialOverleaf: boolean };
+    };
+    assert.equal(validateServerUrl('https://www.overleaf.com/').url, 'https://www.overleaf.com');
+    assert.equal(validateServerUrl('https://www.overleaf.com').isOfficialOverleaf, true);
+    assert.equal(validateServerUrl('https://overleaf.com.attacker.example').isOfficialOverleaf, false);
+    assert.throws(() => validateServerUrl('https://overleaf.com@attacker.example'), /embedded credentials/);
+    assert.throws(() => validateServerUrl('file:///tmp/overleaf'), /HTTP or HTTPS/);
+
     const { SettingsManager, isValidProjectSettings } = require(
         path.join('..', 'utils', 'settingsManager')
     ) as {
         SettingsManager: {
             clearCurrentWorkspaceFolder(): void;
+            getInstance(uri: MockUri): {
+                getFilePath(relativePath: string): MockUri;
+                getRelativePath(uri: MockUri): string | undefined;
+            };
             createDefaultSettings(serverUrl: string, projectId: string, projectName: string): {
                 mainTex?: string;
                 mainPdf?: string;
@@ -767,6 +1069,17 @@ async function run(): Promise<void> {
         projectName: 'Project',
         mainTex: 42,
     }), false, 'invalid optional values must not pass the stored-settings validator');
+    assert.equal(isValidProjectSettings({
+        serverUrl: 'https://overleaf.example',
+        projectId: 'project-id',
+        projectName: 'Project',
+        mainTex: '../outside.tex',
+    }), false, 'main-document settings must remain inside the project');
+    assert.equal(isValidProjectSettings({
+        serverUrl: 'file:///tmp/not-a-server',
+        projectId: 'project-id',
+        projectName: 'Project',
+    }), false, 'project settings must reject non-HTTP server URLs');
 
     const linkedSettings = JSON.stringify({
         serverUrl: 'https://overleaf.example',
@@ -785,6 +1098,11 @@ async function run(): Promise<void> {
     assert.equal(resolvedManager?.getWorkspaceFolder().toString(), workspaceRoot.toString(),
         'activation must restore a valid LocalLeaf project already open as a workspace root');
     assert.equal((await SettingsManager.inspectFolder(workspaceRoot)).kind, 'linked');
+    const pathManager = SettingsManager.getInstance(workspaceRoot);
+    assert.equal(pathManager.getFilePath('/safe/file.tex').fsPath, 'D:\\workspace\\safe\\file.tex');
+    assert.throws(() => pathManager.getFilePath('/../outside.tex'), /Unsafe Overleaf entity name/);
+    assert.throws(() => pathManager.getFilePath('/'), /workspace root/);
+    assert.equal(pathManager.getRelativePath(mockFileUri('D:\\workspace-evil\\file.tex')), undefined);
 
     resetMockWorkspace([workspaceRoot], [
         ['D:\\workspace', { type: 2 }],
@@ -889,9 +1207,13 @@ async function run(): Promise<void> {
         'compiled test code must not be packaged');
     assert.match(vscodeIgnore, /^out\/test\/runTest\.js$/m,
         'the compiled regression runner must be explicitly excluded from the VSIX');
-    ignoreParser.settings = { mainTex: 'thesis.tex', mainPdf: 'thesis.pdf' };
+    ignoreParser.settings = { mainTex: 'thesis[1].tex', mainPdf: 'thesis[1].pdf' };
     ignoreParser.resolveVariables();
-    assert.deepStrictEqual(ignoreParser.resolvedPatterns, ['thesis.tex', 'thesis.pdf', '*.aux']);
+    assert.deepStrictEqual(
+        ignoreParser.resolvedPatterns,
+        ['thesis\\[1\\].tex', 'thesis\\[1\\].pdf', '*.aux'],
+        'main-document names must be treated as literal ignore paths, not glob syntax',
+    );
 
     const manifest = JSON.parse(fs.readFileSync(
         path.join(__dirname, '..', '..', 'package.json'),
@@ -902,6 +1224,7 @@ async function run(): Promise<void> {
             viewsContainers?: { activitybar?: Array<{ id?: string }> };
             views?: { localleaf?: Array<{ id?: string; type?: string }> };
         };
+        capabilities?: { untrustedWorkspaces?: { supported?: boolean } };
     };
     assert.equal(manifest.publisher, 'teddy-van-jerry');
     assert.equal(manifest.contributes?.viewsContainers?.activitybar?.[0]?.id, 'localleaf');
@@ -911,6 +1234,11 @@ async function run(): Promise<void> {
             ['localleaf.projectsView', 'webview'],
             ['localleaf.mainView', 'webview'],
         ],
+    );
+    assert.equal(
+        manifest.capabilities?.untrustedWorkspaces?.supported,
+        false,
+        'LocalLeaf must stay disabled in untrusted workspaces because it writes remote content locally',
     );
 
     assert.equal(readInstalledPackageVersion('form-data'), '4.0.6');

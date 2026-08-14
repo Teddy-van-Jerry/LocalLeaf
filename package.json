@@ -27,6 +27,12 @@
     "onView:localleaf.projectsView",
     "onView:localleaf.mainView"
   ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "LocalLeaf synchronizes workspace files with an Overleaf server and requires a trusted workspace."
+    }
+  },
   "main": "./out/extension.js",
   "contributes": {
     "viewsContainers": {

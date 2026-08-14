@@ -38,7 +38,11 @@ export class AccountPanel {
                 return;
             }
             const action = this.parseAction(message);
-            if (action) void this.onAction(action);
+            if (action) {
+                void this.onAction(action).catch(error => {
+                    console.error('[LocalLeaf] Account action failed:', error);
+                });
+            }
         });
         this.panel.webview.html = this.getHtml(this.panel.webview);
     }
@@ -74,7 +78,9 @@ export class AccountPanel {
 
     private updateState(state: AccountPanelState): void {
         this.state = state;
-        void this.panel.webview.postMessage({ type: 'state', state });
+        void this.panel.webview.postMessage({ type: 'state', state }).then(undefined, error => {
+            console.error('[LocalLeaf] Failed to update Account panel:', error);
+        });
     }
 
     private parseAction(raw: unknown): AccountPanelAction | undefined {

@@ -97,7 +97,10 @@ export class MainWebviewProvider implements vscode.WebviewViewProvider {
             localResourceRoots: [vscode.Uri.joinPath(this.extensionUri, 'images')],
         };
         webviewView.webview.onDidReceiveMessage((message: unknown) => {
-            void this.handleMessage(message);
+            void this.handleMessage(message).catch(error => {
+                console.error('[LocalLeaf] Sidebar action failed:', error);
+                void vscode.window.showErrorMessage(`LocalLeaf: ${error instanceof Error ? error.message : String(error)}`);
+            });
         });
         webviewView.webview.html = this.getHtml(webviewView.webview);
     }
@@ -115,7 +118,7 @@ export class MainWebviewProvider implements vscode.WebviewViewProvider {
             nextState.notice = buildNotice(nextState);
             this.publishState(nextState);
         } else {
-            void this.refresh();
+            this.scheduleRefresh();
         }
     }
 
@@ -126,7 +129,7 @@ export class MainWebviewProvider implements vscode.WebviewViewProvider {
         if (this.state) {
             this.publishState({ ...this.state, onlineUsers: nextUsers });
         } else {
-            void this.refresh();
+            this.scheduleRefresh();
         }
     }
 
@@ -144,7 +147,15 @@ export class MainWebviewProvider implements vscode.WebviewViewProvider {
 
     private publishState(state: MainViewState): void {
         this.state = state;
-        void this.view?.webview.postMessage({ type: 'state', state });
+        void this.view?.webview.postMessage({ type: 'state', state }).then(undefined, error => {
+            console.error('[LocalLeaf] Failed to update LocalLeaf sidebar:', error);
+        });
+    }
+
+    private scheduleRefresh(): void {
+        void this.refresh().catch(error => {
+            console.error('[LocalLeaf] Failed to refresh LocalLeaf sidebar:', error);
+        });
     }
 
     private async buildState(): Promise<MainViewState> {

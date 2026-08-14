@@ -4,8 +4,10 @@
  */
 
 import * as vscode from 'vscode';
+import { FolderEntity } from '../api/base';
 import { SocketIOAPI, OnlineUser, UserCursorUpdate } from '../api/socketio';
 import { SettingsManager } from '../utils/settingsManager';
+import { assertSafeWorkspacePath, joinProjectPath } from '../utils/pathSafety';
 
 /**
  * User cursor colors - matches Overleaf's color palette
@@ -94,7 +96,7 @@ export class CursorTracker {
         // This will be populated by the sync engine
         // For now, we'll get paths from the project tree
         const project = this.socket.project;
-        if (project) {
+        if (project?.rootFolder?.[0]) {
             this.traverseProject(project.rootFolder[0], '', true);
         }
     }
@@ -102,12 +104,12 @@ export class CursorTracker {
     /**
      * Traverse project tree to build doc ID to path mapping
      */
-    private traverseProject(folder: any, parentPath: string, isRoot: boolean = false): void {
+    private traverseProject(folder: FolderEntity, parentPath: string, isRoot: boolean = false): void {
         // Root folder contents go directly to /, subfolders include their name
-        const folderPath = isRoot ? '/' : parentPath + folder.name + '/';
+        const folderPath = isRoot ? '/' : joinProjectPath(parentPath, folder.name, true);
 
         for (const doc of folder.docs || []) {
-            this.docIdToPath.set(doc._id, folderPath + doc.name);
+            this.docIdToPath.set(doc._id, joinProjectPath(folderPath, doc.name, false));
         }
 
         for (const subfolder of folder.folders || []) {
@@ -145,8 +147,12 @@ export class CursorTracker {
 
         // Listen for selection changes to update our position
         this.disposables.push(
-            vscode.window.onDidChangeTextEditorSelection(e => this.handleLocalSelectionChange(e)),
-            vscode.window.onDidChangeVisibleTextEditors(editors => this.refreshDecorations())
+            vscode.window.onDidChangeTextEditorSelection(e => {
+                void this.handleLocalSelectionChange(e).catch(error => {
+                    console.error('[LocalLeaf] Failed to publish cursor position:', error);
+                });
+            }),
+            vscode.window.onDidChangeVisibleTextEditors(() => this.refreshDecorations())
         );
     }
 
@@ -174,16 +180,35 @@ export class CursorTracker {
      * Add or update a user's cursor
      */
     private addOrUpdateUser(user: OnlineUser): void {
+        if (
+            typeof user.clientId !== 'string'
+            || user.clientId.length === 0
+            || user.clientId.length > 1024
+            || typeof user.userId !== 'string'
+            || user.userId.length > 1024
+            || typeof user.name !== 'string'
+            || user.name.length > 4096
+            || typeof user.email !== 'string'
+            || user.email.length > 4096
+            || typeof user.docId !== 'string'
+            || user.docId.length > 1024
+        ) {
+            return;
+        }
         const existing = this.users.get(user.clientId);
+        if (!existing && this.users.size >= 1000) return;
+        const row = Number.isSafeInteger(user.row) && user.row >= 0 ? user.row : 0;
+        const column = Number.isSafeInteger(user.column) && user.column >= 0 ? user.column : 0;
+        const lastUpdated = Number.isFinite(user.lastUpdated) ? user.lastUpdated : Date.now();
 
         if (existing) {
             // Update existing user
             const oldDocPath = existing.docPath;
             existing.docId = user.docId;
             existing.docPath = this.docIdToPath.get(user.docId);
-            existing.row = user.row;
-            existing.column = user.column;
-            existing.lastUpdated = user.lastUpdated;
+            existing.row = row;
+            existing.column = column;
+            existing.lastUpdated = lastUpdated;
 
             // Clear decoration from old document if changed
             if (oldDocPath && oldDocPath !== existing.docPath) {
@@ -209,7 +234,9 @@ export class CursorTracker {
             });
 
             const hoverMessage = new vscode.MarkdownString();
-            hoverMessage.appendMarkdown(`<span style="color:${color};"><b>${user.name}</b></span>`);
+            hoverMessage.appendMarkdown(`<span style="color:${color};"><b>`);
+            hoverMessage.appendText(user.name);
+            hoverMessage.appendMarkdown('</b></span>');
             hoverMessage.supportHtml = true;
 
             const tracked: TrackedUser = {
@@ -219,9 +246,9 @@ export class CursorTracker {
                 email: user.email,
                 docId: user.docId,
                 docPath: this.docIdToPath.get(user.docId),
-                row: user.row,
-                column: user.column,
-                lastUpdated: user.lastUpdated,
+                row,
+                column,
+                lastUpdated,
                 color,
                 decoration,
                 hoverMessage,
@@ -238,17 +265,26 @@ export class CursorTracker {
     private updateDecoration(user: TrackedUser): void {
         if (!user.docPath) return;
 
-        const workspaceFolder = this.settings.getWorkspaceFolder();
-        // Remove leading slash for proper path joining
-        const relativePath = user.docPath.startsWith('/') ? user.docPath.slice(1) : user.docPath;
-        const uri = vscode.Uri.joinPath(workspaceFolder, relativePath);
+        let uri: vscode.Uri;
+        try {
+            uri = this.settings.getFilePath(user.docPath);
+        } catch {
+            return;
+        }
 
         const editor = vscode.window.visibleTextEditors.find(
             e => e.document.uri.toString() === uri.toString()
         );
 
         if (editor) {
-            const range = new vscode.Range(user.row, user.column, user.row, user.column + 1);
+            if (!Number.isSafeInteger(user.row) || !Number.isSafeInteger(user.column) || user.row < 0 || user.column < 0) {
+                return;
+            }
+            if (user.row >= editor.document.lineCount) return;
+            const lineLength = editor.document.lineAt(user.row).text.length;
+            const column = Math.min(user.column, lineLength);
+            const endColumn = Math.min(column + 1, lineLength);
+            const range = new vscode.Range(user.row, column, user.row, endColumn);
             editor.setDecorations(user.decoration, [{
                 range,
                 hoverMessage: user.hoverMessage,
@@ -260,10 +296,12 @@ export class CursorTracker {
      * Clear decoration for a user from a specific document
      */
     private clearDecoration(user: TrackedUser, docPath: string): void {
-        const workspaceFolder = this.settings.getWorkspaceFolder();
-        // Remove leading slash for proper path joining
-        const relativePath = docPath.startsWith('/') ? docPath.slice(1) : docPath;
-        const uri = vscode.Uri.joinPath(workspaceFolder, relativePath);
+        let uri: vscode.Uri;
+        try {
+            uri = this.settings.getFilePath(docPath);
+        } catch {
+            return;
+        }
 
         const editor = vscode.window.visibleTextEditors.find(
             e => e.document.uri.toString() === uri.toString()
@@ -307,11 +345,8 @@ export class CursorTracker {
         const uri = event.textEditor.document.uri;
         if (uri.scheme !== 'file') return;
 
-        // Get relative path
-        const workspacePath = this.settings.getWorkspaceFolder().path;
-        if (!uri.path.startsWith(workspacePath)) return;
-
-        const relativePath = uri.path.slice(workspacePath.length);
+        const relativePath = this.settings.getRelativePath(uri);
+        if (!relativePath || relativePath === '/') return;
 
         // Find doc ID for this path
         let docId: string | undefined;
@@ -326,7 +361,7 @@ export class CursorTracker {
             const selection = event.selections[0];
             try {
                 await this.socket.updatePosition(docId, selection.active.line, selection.active.character);
-            } catch (error) {
+            } catch {
                 // Ignore errors (e.g., if disconnected)
             }
         }
@@ -377,34 +412,32 @@ export class CursorTracker {
                 user = selected.user;
             }
         } else {
-            vscode.window.showInformationMessage('No collaborators online');
+            void vscode.window.showInformationMessage('No collaborators online');
             return;
         }
 
         if (user && user.docPath) {
-            const workspaceFolder = this.settings.getWorkspaceFolder();
-            // Remove leading slash from docPath for proper joining
-            const relativePath = user.docPath.startsWith('/') ? user.docPath.slice(1) : user.docPath;
-            const uri = vscode.Uri.joinPath(workspaceFolder, relativePath);
-
             try {
+                const uri = this.settings.getFilePath(user.docPath);
+                await assertSafeWorkspacePath(this.settings.getWorkspaceFolder(), uri);
+                const row = Number.isSafeInteger(user.row) && user.row >= 0 ? user.row : 0;
+                const column = Number.isSafeInteger(user.column) && user.column >= 0 ? user.column : 0;
                 await vscode.window.showTextDocument(uri, {
-                    selection: new vscode.Selection(user.row, user.column, user.row, user.column),
+                    selection: new vscode.Selection(row, column, row, column),
                     preview: false,
                 });
-            } catch (error) {
+            } catch {
                 // File might not exist locally yet, offer to pull
-                vscode.window.showWarningMessage(
+                const choice = await vscode.window.showWarningMessage(
                     `Cannot open ${user.docPath}. The file may not exist locally. Try pulling from Overleaf.`,
                     'Pull Now'
-                ).then(choice => {
-                    if (choice === 'Pull Now') {
-                        vscode.commands.executeCommand('localleaf.pullFromOverleaf');
-                    }
-                });
+                );
+                if (choice === 'Pull Now') {
+                    await vscode.commands.executeCommand('localleaf.pullFromOverleaf');
+                }
             }
         } else if (user) {
-            vscode.window.showInformationMessage(`${user.name} is not currently editing a document`);
+            void vscode.window.showInformationMessage(`${user.name} is not currently editing a document`);
         }
     }
 
