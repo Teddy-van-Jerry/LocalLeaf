@@ -37,6 +37,7 @@ let authState: AuthState = 'none';
 let projectsWebviewProvider: ProjectsWebviewProvider;
 let mainWebviewProvider: MainWebviewProvider;
 const linkOperationGate = new LinkOperationGate();
+const panelConfirmation = Object.freeze({ source: 'localleaf-panel' });
 
 function errorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
@@ -60,7 +61,17 @@ export async function activate(context: vscode.ExtensionContext) {
 
     // Register the Activity Bar views adapted from PR #3.
     projectsWebviewProvider = new ProjectsWebviewProvider(context.extensionUri, credentialManager);
-    mainWebviewProvider = new MainWebviewProvider(context.extensionUri, credentialManager);
+    mainWebviewProvider = new MainWebviewProvider(
+        context.extensionUri,
+        credentialManager,
+        async command => {
+            if (command === COMMANDS.CLEAN_IGNORED_REMOTE) {
+                await cmdCleanIgnoredRemoteFiles(panelConfirmation);
+            } else if (command === COMMANDS.UNLINK_FOLDER) {
+                await cmdUnlinkFolder(panelConfirmation);
+            }
+        },
+    );
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider(
             ProjectsWebviewProvider.viewType,
@@ -75,7 +86,7 @@ export async function activate(context: vscode.ExtensionContext) {
     );
 
     // Resolve the view context before slower authentication and network work.
-    const settingsManager = SettingsManager.getCurrentInstance();
+    let settingsManager = await SettingsManager.resolveCurrentInstance();
     const isLinked = Boolean(settingsManager && await settingsManager.isLinked());
     await vscode.commands.executeCommand('setContext', 'localleaf.isLinked', isLinked);
 
@@ -116,17 +127,31 @@ export async function activate(context: vscode.ExtensionContext) {
     }
 
     // Watch for settings changes
-    const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri;
+    const workspaceFolder = settingsManager?.getWorkspaceFolder()
+        ?? vscode.workspace.workspaceFolders?.[0]?.uri;
     if (workspaceFolder) {
         const settingsWatcher = createSettingsWatcher(workspaceFolder, async () => {
             log('Settings changed, reloading...');
+            settingsManager = await SettingsManager.resolveCurrentInstance();
             await settingsManager?.load();
             const linked = Boolean(settingsManager && await settingsManager.isLinked());
             await vscode.commands.executeCommand('setContext', 'localleaf.isLinked', linked);
+            if (!linked) {
+                statusBarItem.hide();
+                collaboratorStatusItem.hide();
+            }
             await refreshGui();
         });
         context.subscriptions.push(settingsWatcher);
     }
+
+    context.subscriptions.push(vscode.workspace.onDidChangeWorkspaceFolders(async () => {
+        SettingsManager.clearCurrentWorkspaceFolder();
+        settingsManager = await SettingsManager.resolveCurrentInstance();
+        const linked = Boolean(settingsManager && await settingsManager.isLinked());
+        await vscode.commands.executeCommand('setContext', 'localleaf.isLinked', linked);
+        await refreshGui();
+    }));
 
     await refreshGui();
     log('LocalLeaf activated');
@@ -240,17 +265,40 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
  */
 function updateStatusBar(status: SyncStatus, message?: string) {
     const icons: Record<SyncStatus, string> = {
+        disconnected: '$(cloud-offline)',
+        connecting: '$(sync~spin)',
         idle: '$(cloud)',
         syncing: '$(sync~spin)',
         pulling: '$(cloud-download)',
         pushing: '$(cloud-upload)',
         error: '$(warning)',
-        disconnected: '$(cloud-offline)',
+    };
+    const labels: Record<SyncStatus, string> = {
+        disconnected: 'Disconnected',
+        connecting: 'Connecting',
+        idle: 'Up to date',
+        syncing: 'Syncing',
+        pulling: 'Pulling',
+        pushing: 'Pushing',
+        error: 'Error',
     };
 
-    statusBarItem.text = `${icons[status]} LocalLeaf`;
-    statusBarItem.tooltip = new vscode.MarkdownString(`**LocalLeaf** - ${message || status}`);
+    statusBarItem.text = `${icons[status]} LocalLeaf: ${labels[status]}`;
+    const tooltip = new vscode.MarkdownString();
+    tooltip.appendMarkdown(`**LocalLeaf — ${labels[status]}**\n\n`);
+    const settings = SettingsManager.getCurrentInstance()?.getSettings();
+    if (settings?.projectName) {
+        tooltip.appendText(`Project: ${settings.projectName}`);
+        tooltip.appendMarkdown('\n\n');
+    }
+    tooltip.appendText(message || labels[status]);
+    tooltip.appendMarkdown('\n\n_Click to show synchronization details_');
+    statusBarItem.tooltip = tooltip;
     statusBarItem.command = COMMANDS.SHOW_SYNC_STATUS;
+    statusBarItem.accessibilityInformation = {
+        label: `LocalLeaf ${labels[status]}. ${message || labels[status]}`,
+        role: 'button',
+    };
 
     if (status === 'error') {
         statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
@@ -812,20 +860,22 @@ async function cmdLinkFolder(context: vscode.ExtensionContext, requestedProject?
 /**
  * Unlink current folder
  */
-async function cmdUnlinkFolder() {
+async function cmdUnlinkFolder(confirmation?: object) {
     const settingsManager = SettingsManager.getCurrentInstance();
     if (!settingsManager || !(await settingsManager.isLinked())) {
         vscode.window.showInformationMessage('LocalLeaf: This folder is not linked');
         return;
     }
 
-    const confirm = await vscode.window.showWarningMessage(
-        'Are you sure you want to unlink this folder from Overleaf?',
-        { modal: true },
-        'Unlink'
-    );
+    if (confirmation !== panelConfirmation) {
+        const confirm = await vscode.window.showWarningMessage(
+            'Are you sure you want to unlink this folder from Overleaf?',
+            { modal: true },
+            'Unlink'
+        );
 
-    if (confirm !== 'Unlink') return;
+        if (confirm !== 'Unlink') return;
+    }
 
     // Disconnect
     if (syncEngine) {
@@ -924,7 +974,7 @@ async function cmdEditIgnorePatterns() {
  * Remove stale remote files only after they match the current .leafignore
  * rules and the user explicitly confirms the operation.
  */
-async function cmdCleanIgnoredRemoteFiles() {
+async function cmdCleanIgnoredRemoteFiles(confirmation?: object) {
     if (!syncEngine) {
         vscode.window.showWarningMessage('LocalLeaf: Not connected. Please link a folder first.');
         return;
@@ -941,13 +991,15 @@ async function cmdCleanIgnoredRemoteFiles() {
         const remaining = paths.length - visiblePaths.length;
         const preview = visiblePaths.join('\n') +
             (remaining > 0 ? `\n... and ${remaining} more` : '');
-        const choice = await vscode.window.showWarningMessage(
-            `Delete ${paths.length} ignored file(s) from Overleaf?\n\n${preview}`,
-            { modal: true },
-            'Delete Ignored Files'
-        );
-        if (choice !== 'Delete Ignored Files') {
-            return;
+        if (confirmation !== panelConfirmation) {
+            const choice = await vscode.window.showWarningMessage(
+                `Delete ${paths.length} ignored file(s) from Overleaf?\n\n${preview}`,
+                { modal: true },
+                'Delete Ignored Files'
+            );
+            if (choice !== 'Delete Ignored Files') {
+                return;
+            }
         }
 
         const result = await vscode.window.withProgress({
@@ -1133,7 +1185,7 @@ async function cmdReconnect() {
     });
 
     try {
-        updateStatusBar('syncing', 'Reconnecting...');
+        updateStatusBar('connecting', 'Reconnecting...');
         await syncEngine.connect();
 
         const socket = syncEngine.getSocket();

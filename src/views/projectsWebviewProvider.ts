@@ -2,13 +2,34 @@ import * as vscode from 'vscode';
 import { BaseAPI, ProjectInfo } from '../api/base';
 import { COMMANDS } from '../consts';
 import { CredentialManager } from '../utils/credentialManager';
+import {
+    DetectedLocalLeafProject,
+    SettingsManager,
+    WorkspaceFolderKind,
+} from '../utils/settingsManager';
 import { createNonce } from './webviewUtils';
 
-type ProjectsViewStatus = 'no-folder' | 'not-logged-in' | 'loading' | 'ready' | 'error';
+type ProjectsViewStatus =
+    | 'no-folder'
+    | 'incompatible-folder'
+    | 'local-projects'
+    | 'not-logged-in'
+    | 'loading'
+    | 'ready'
+    | 'error';
+
+interface LocalProjectSummary {
+    uri: string;
+    projectName: string;
+    relativePath: string;
+    serverUrl: string;
+}
 
 interface ProjectsViewState {
     status: ProjectsViewStatus;
     projects: ProjectInfo[];
+    localProjects: LocalProjectSummary[];
+    workspaceKind?: Exclude<WorkspaceFolderKind, 'linked' | 'unsupported'>;
     message?: string;
     openingProjectId?: string;
 }
@@ -18,6 +39,7 @@ type ProjectsWebviewMessage =
     | { type: 'refresh' }
     | { type: 'login' }
     | { type: 'openFolder' }
+    | { type: 'openLocalProject'; uri: string }
     | { type: 'openProject'; projectId: string };
 
 /**
@@ -29,8 +51,9 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
 
     private view?: vscode.WebviewView;
     private projects: ProjectInfo[] = [];
+    private localProjects: DetectedLocalLeafProject[] = [];
     private refreshVersion = 0;
-    private state: ProjectsViewState = { status: 'loading', projects: [] };
+    private state: ProjectsViewState = { status: 'loading', projects: [], localProjects: [] };
 
     constructor(
         private readonly extensionUri: vscode.Uri,
@@ -55,21 +78,71 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
 
     async refresh(): Promise<void> {
         const version = ++this.refreshVersion;
-        const folder = vscode.workspace.workspaceFolders?.[0]?.uri;
-        if (!folder) {
+        const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
+        if (workspaceFolders.length === 0) {
             this.projects = [];
-            this.updateState({ status: 'no-folder', projects: [] });
+            this.localProjects = [];
+            this.updateState({ status: 'no-folder', projects: [], localProjects: [] });
             return;
         }
 
-        this.updateState({ status: 'loading', projects: [] });
+        const fileFolders = workspaceFolders.filter(folder => folder.uri.scheme === 'file');
+        if (fileFolders.length === 0) {
+            this.projects = [];
+            this.localProjects = [];
+            this.updateState({
+                status: 'incompatible-folder',
+                projects: [],
+                localProjects: [],
+                message: 'LocalLeaf requires a local file-system folder.',
+            });
+            return;
+        }
+
+        const [inspection, localProjects] = await Promise.all([
+            SettingsManager.inspectFolder(fileFolders[0].uri),
+            SettingsManager.findLinkedProjectFolders(),
+        ]);
+        this.localProjects = localProjects;
+        if (version !== this.refreshVersion) return;
+
+        const nestedProjects = this.localProjects.filter(project =>
+            project.uri.toString() !== fileFolders[0].uri.toString()
+        );
+        if (inspection.kind === 'linked' || nestedProjects.length > 0) {
+            this.projects = [];
+            this.updateState({
+                status: 'local-projects',
+                projects: [],
+                localProjects: summarizeLocalProjects(this.localProjects),
+            });
+            return;
+        }
+        if (inspection.kind === 'unsupported') {
+            this.projects = [];
+            this.updateState({
+                status: 'incompatible-folder',
+                projects: [],
+                localProjects: [],
+                message: 'This workspace folder cannot be read from the local file system.',
+            });
+            return;
+        }
+
+        const workspaceKind = inspection.kind;
+        this.updateState({ status: 'loading', projects: [], localProjects: [], workspaceKind });
         const serverUrl = this.credentialManager.getDefaultServer();
         const credential = await this.credentialManager.getCredential(serverUrl);
         if (version !== this.refreshVersion) return;
 
         if (!credential) {
             this.projects = [];
-            this.updateState({ status: 'not-logged-in', projects: [] });
+            this.updateState({
+                status: 'not-logged-in',
+                projects: [],
+                localProjects: [],
+                workspaceKind,
+            });
             return;
         }
 
@@ -84,19 +157,28 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
                 this.updateState({
                     status: 'error',
                     projects: [],
+                    localProjects: [],
+                    workspaceKind,
                     message: result.message || 'Could not load Overleaf projects.',
                 });
                 return;
             }
 
             this.projects = result.projects.filter(project => !project.archived && !project.trashed);
-            this.updateState({ status: 'ready', projects: this.projects });
+            this.updateState({
+                status: 'ready',
+                projects: this.projects,
+                localProjects: [],
+                workspaceKind,
+            });
         } catch (error) {
             if (version !== this.refreshVersion) return;
             this.projects = [];
             this.updateState({
                 status: 'error',
                 projects: [],
+                localProjects: [],
+                workspaceKind,
                 message: error instanceof Error ? error.message : String(error),
             });
         }
@@ -109,7 +191,7 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
 
     private async handleMessage(raw: unknown): Promise<void> {
         if (!raw || typeof raw !== 'object') return;
-        const message = raw as Partial<ProjectsWebviewMessage> & { projectId?: unknown };
+        const message = raw as Partial<ProjectsWebviewMessage> & { projectId?: unknown; uri?: unknown };
 
         switch (message.type) {
             case 'ready':
@@ -124,6 +206,14 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
             case 'openFolder':
                 await vscode.commands.executeCommand('vscode.openFolder');
                 break;
+            case 'openLocalProject': {
+                if (typeof message.uri !== 'string') return;
+                const project = this.localProjects.find(candidate => candidate.uri.toString() === message.uri);
+                if (project) {
+                    await vscode.commands.executeCommand('vscode.openFolder', project.uri, false);
+                }
+                break;
+            }
             case 'openProject': {
                 if (typeof message.projectId !== 'string') return;
                 const project = this.projects.find(candidate => candidate.id === message.projectId);
@@ -183,6 +273,13 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
             padding: 4px 8px;
         }
         .meta { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 8px 1px; color: var(--vscode-descriptionForeground); font-size: 11px; }
+        .workspace-notice {
+            margin: 0 0 9px; padding: 8px 9px; border: 1px solid var(--vscode-panel-border);
+            border-left: 3px solid var(--vscode-editorInfo-foreground); border-radius: 5px;
+            color: var(--vscode-foreground); background: var(--vscode-editorWidget-background, transparent);
+            line-height: 1.4; font-size: 11px;
+        }
+        .workspace-notice.warning { border-left-color: var(--vscode-editorWarning-foreground); }
         .refresh {
             border: 0; border-radius: 4px; padding: 3px 7px; color: var(--vscode-button-secondaryForeground);
             background: var(--vscode-button-secondaryBackground); cursor: pointer;
@@ -196,6 +293,7 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
             text-align: left; cursor: pointer;
         }
         .project:hover { color: var(--vscode-list-hoverForeground); background: var(--vscode-list-hoverBackground); }
+        .project:focus-visible { background: var(--vscode-list-focusBackground); color: var(--vscode-list-focusForeground); }
         .project:disabled { opacity: .65; cursor: wait; }
         .project-icon {
             display: grid; place-items: center; width: 28px; height: 28px; border-radius: 7px;
@@ -212,13 +310,15 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
         .state-copy { color: var(--vscode-descriptionForeground); line-height: 1.45; }
         .primary { margin-top: 12px; padding: 7px 11px; border: 0; border-radius: 5px; cursor: pointer; color: var(--vscode-button-foreground); background: var(--vscode-button-background); }
         .primary:hover { background: var(--vscode-button-hoverBackground); }
+        .secondary { margin-top: 7px; color: var(--vscode-descriptionForeground); }
         .spinner { width: 22px; height: 22px; margin: 0 auto 12px; border: 2px solid var(--vscode-panel-border); border-top-color: var(--vscode-progressBar-background); border-radius: 50%; animation: spin .8s linear infinite; }
         @keyframes spin { to { transform: rotate(360deg); } }
+        @media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
     </style>
 </head>
 <body>
-    <main id="root" class="shell" aria-live="polite">
-        <section class="state"><div class="state-card"><div class="spinner"></div><div class="state-title">Loading LocalLeaf…</div></div></section>
+    <main id="root" class="shell">
+        <section class="state" role="status" aria-live="polite"><div class="state-card"><div class="spinner" aria-hidden="true"></div><div class="state-title">Loading LocalLeaf…</div></div></section>
     </main>
     <script nonce="${nonce}">
         const vscode = acquireVsCodeApi();
@@ -244,11 +344,46 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
 
         function renderState(icon, title, copy, action) {
             const wrapper = element('section', 'state');
+            wrapper.setAttribute('role', state && (state.status === 'error' || state.status === 'incompatible-folder') ? 'alert' : 'status');
+            wrapper.setAttribute('aria-live', 'polite');
             const card = element('div', 'state-card');
-            card.append(element('div', 'state-icon', icon), element('div', 'state-title', title), element('div', 'state-copy', copy));
+            const stateIcon = element('div', 'state-icon', icon);
+            stateIcon.setAttribute('aria-hidden', 'true');
+            card.append(stateIcon, element('div', 'state-title', title), element('div', 'state-copy', copy));
             if (action) card.append(actionButton(action.label, action.message));
             wrapper.append(card);
             root.replaceChildren(wrapper);
+        }
+
+        function workspaceNotice() {
+            if (!state.workspaceKind) return null;
+            const warning = state.workspaceKind !== 'empty';
+            const notice = element('div', 'workspace-notice' + (warning ? ' warning' : ''));
+            notice.setAttribute('role', warning ? 'alert' : 'status');
+            if (state.workspaceKind === 'empty') {
+                notice.textContent = 'This folder is empty and ready to link to an Overleaf project.';
+            } else if (state.workspaceKind === 'invalid-config') {
+                notice.textContent = 'The existing .localleaf configuration is invalid. Linking a project will replace it.';
+            } else {
+                notice.textContent = 'This folder already contains files. LocalLeaf will ask for confirmation before linking it.';
+            }
+            return notice;
+        }
+
+        function installListKeyboardNavigation(list) {
+            list.addEventListener('keydown', event => {
+                if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+                const items = Array.from(list.querySelectorAll('button.project:not(:disabled)'));
+                if (items.length === 0) return;
+                const current = items.indexOf(document.activeElement);
+                let target = current;
+                if (event.key === 'Home') target = 0;
+                else if (event.key === 'End') target = items.length - 1;
+                else if (event.key === 'ArrowDown') target = current < 0 ? 0 : (current + 1) % items.length;
+                else target = current <= 0 ? items.length - 1 : current - 1;
+                event.preventDefault();
+                items[target].focus();
+            });
         }
 
         function initials(name) {
@@ -274,7 +409,10 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
             icon.src = '${iconUri}';
             icon.alt = '';
             const brandCopy = element('div', 'brand-copy');
-            brandCopy.append(element('div', 'brand-title', 'Overleaf Projects'), element('div', 'brand-subtitle', 'Choose a project to link this folder'));
+            const subtitle = state.workspaceKind === 'empty'
+                ? 'Link this empty folder to Overleaf'
+                : 'Choose a project to link this folder';
+            brandCopy.append(element('div', 'brand-title', 'Overleaf Projects'), element('div', 'brand-subtitle', subtitle));
             brand.append(icon, brandCopy);
 
             const toolbar = element('div', 'toolbar');
@@ -282,6 +420,7 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
             search.type = 'search';
             search.placeholder = 'Search projects';
             search.setAttribute('aria-label', 'Search projects');
+            search.setAttribute('aria-controls', 'projects-list');
             search.value = filterText;
             search.addEventListener('input', () => {
                 filterText = search.value;
@@ -305,14 +444,21 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
 
             const meta = element('div', 'meta');
             const count = element('span', 'count');
+            count.id = 'project-count';
+            count.setAttribute('aria-live', 'polite');
             const refresh = element('button', 'refresh', 'Refresh');
             refresh.type = 'button';
+            refresh.setAttribute('aria-label', 'Refresh Overleaf projects');
             refresh.addEventListener('click', () => vscode.postMessage({ type: 'refresh' }));
             meta.append(count, refresh);
             const list = element('section', 'list');
+            list.id = 'projects-list';
             list.setAttribute('aria-label', 'Overleaf projects');
+            list.setAttribute('aria-describedby', 'project-count');
+            installListKeyboardNavigation(list);
 
-            root.replaceChildren(brand, toolbar, meta, list);
+            const notice = workspaceNotice();
+            root.replaceChildren(...[brand, notice, toolbar, meta, list].filter(Boolean));
 
             function renderList() {
                 const visible = sortedProjects();
@@ -322,6 +468,7 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
                     row.type = 'button';
                     row.disabled = Boolean(state.openingProjectId);
                     row.title = 'Link to ' + project.name;
+                    row.setAttribute('aria-label', 'Link to ' + project.name + ', access ' + project.accessLevel);
                     row.addEventListener('click', () => vscode.postMessage({ type: 'openProject', projectId: project.id }));
                     const badge = element('span', 'project-icon', initials(project.name));
                     const copy = element('span', 'project-copy');
@@ -339,14 +486,66 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
             renderList();
         }
 
+        function renderLocalProjects() {
+            const brand = element('header', 'brand');
+            const icon = document.createElement('img');
+            icon.src = '${iconUri}';
+            icon.alt = '';
+            const brandCopy = element('div', 'brand-copy');
+            brandCopy.append(
+                element('div', 'brand-title', 'LocalLeaf Projects'),
+                element('div', 'brand-subtitle', 'Existing linked projects found in this workspace'),
+            );
+            brand.append(icon, brandCopy);
+
+            const notice = element('div', 'workspace-notice');
+            notice.setAttribute('role', 'status');
+            notice.textContent = state.localProjects.length + (state.localProjects.length === 1
+                ? ' linked project was detected. Open it to activate LocalLeaf.'
+                : ' linked projects were detected. Choose one to activate LocalLeaf.');
+
+            const list = element('section', 'list');
+            list.setAttribute('aria-label', 'Detected LocalLeaf projects');
+            installListKeyboardNavigation(list);
+            state.localProjects.forEach(project => {
+                const row = element('button', 'project');
+                row.type = 'button';
+                row.title = 'Open ' + project.projectName;
+                row.setAttribute('aria-label', 'Open local project ' + project.projectName + ' at ' + project.relativePath);
+                row.addEventListener('click', () => vscode.postMessage({ type: 'openLocalProject', uri: project.uri }));
+                const badge = element('span', 'project-icon', initials(project.projectName));
+                const copy = element('span', 'project-copy');
+                copy.append(
+                    element('div', 'project-name', project.projectName),
+                    element('div', 'project-detail', project.relativePath + ' • ' + project.serverUrl),
+                );
+                row.append(badge, copy, element('span', 'access', 'LOCAL'));
+                list.append(row);
+            });
+            root.replaceChildren(brand, notice, list);
+        }
+
         function render() {
             if (!state) return;
             if (state.status === 'no-folder') return renderState('📂', 'Open a folder', 'LocalLeaf needs a workspace folder before it can link an Overleaf project.', { label: 'Open Folder', message: { type: 'openFolder' } });
-            if (state.status === 'not-logged-in') return renderState('◉', 'Sign in to Overleaf', 'Connect your account to browse and link projects.', { label: 'Open Account', message: { type: 'login' } });
+            if (state.status === 'incompatible-folder') return renderState('⚠', 'Unsupported workspace', state.message || 'Open a local file-system folder to use LocalLeaf.', { label: 'Open Folder', message: { type: 'openFolder' } });
+            if (state.status === 'local-projects') return renderLocalProjects();
+            if (state.status === 'not-logged-in') {
+                const context = state.workspaceKind === 'empty'
+                    ? 'This empty folder is ready to link. Sign in to browse your projects.'
+                    : state.workspaceKind === 'invalid-config'
+                        ? 'The existing LocalLeaf settings are invalid. Sign in and choose a project to replace them.'
+                        : 'Connect your account to browse projects. A confirmation will be required before linking this non-empty folder.';
+                return renderState('◉', 'Sign in to Overleaf', context, { label: 'Open Account', message: { type: 'login' } });
+            }
             if (state.status === 'loading') {
                 const wrapper = element('section', 'state');
+                wrapper.setAttribute('role', 'status');
+                wrapper.setAttribute('aria-live', 'polite');
                 const card = element('div', 'state-card');
-                card.append(element('div', 'spinner'), element('div', 'state-title', 'Loading projects…'));
+                const spinner = element('div', 'spinner');
+                spinner.setAttribute('aria-hidden', 'true');
+                card.append(spinner, element('div', 'state-title', 'Loading projects…'));
                 wrapper.append(card);
                 return root.replaceChildren(wrapper);
             }
@@ -365,4 +564,13 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
 </body>
 </html>`;
     }
+}
+
+function summarizeLocalProjects(projects: DetectedLocalLeafProject[]): LocalProjectSummary[] {
+    return projects.map(project => ({
+        uri: project.uri.toString(),
+        projectName: project.settings.projectName,
+        relativePath: project.relativePath,
+        serverUrl: project.settings.serverUrl,
+    }));
 }

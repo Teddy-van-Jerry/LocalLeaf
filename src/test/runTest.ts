@@ -84,6 +84,75 @@ let fetchResponse: {
 
 let executeCommandImpl: (...args: unknown[]) => Promise<unknown> = async () => undefined;
 
+interface MockUri {
+    scheme: string;
+    path: string;
+    fsPath: string;
+    toString(): string;
+}
+
+interface MockFileEntry {
+    type: number;
+    content?: string;
+}
+
+let mockWorkspaceFolders: Array<{ uri: MockUri }> | undefined;
+let mockFileEntries = new Map<string, MockFileEntry>();
+
+function mockFileUri(fsPath: string): MockUri {
+    const normalizedFsPath = path.win32.normalize(fsPath);
+    const uriPath = `/${normalizedFsPath.replace(/\\/g, '/')}`;
+    return {
+        scheme: 'file',
+        path: uriPath,
+        fsPath: normalizedFsPath,
+        toString: () => `file://${uriPath}`,
+    };
+}
+
+function mockUriKey(uri: MockUri | string): string {
+    return path.win32.normalize(typeof uri === 'string' ? uri : uri.fsPath);
+}
+
+function resetMockWorkspace(
+    folders?: MockUri[],
+    entries: Array<[string, MockFileEntry]> = [],
+): void {
+    mockWorkspaceFolders = folders?.map(uri => ({ uri }));
+    mockFileEntries = new Map(entries.map(([entryPath, entry]) => [
+        path.win32.normalize(entryPath),
+        entry,
+    ]));
+}
+
+const mockWorkspaceFs = {
+    async readFile(uri: MockUri | string): Promise<Uint8Array> {
+        const entry = mockFileEntries.get(mockUriKey(uri));
+        if (!entry || entry.type !== 1) throw new MockFileSystemError('File not found');
+        return new TextEncoder().encode(entry.content ?? '');
+    },
+    async stat(uri: MockUri | string): Promise<{ type: number }> {
+        const entry = mockFileEntries.get(mockUriKey(uri));
+        if (!entry) throw new MockFileSystemError('File not found');
+        return { type: entry.type };
+    },
+    async readDirectory(uri: MockUri | string): Promise<Array<[string, number]>> {
+        const directoryPath = mockUriKey(uri);
+        const directory = mockFileEntries.get(directoryPath);
+        if (!directory || directory.type !== 2) throw new MockFileSystemError('Directory not found');
+        const children: Array<[string, number]> = [];
+        for (const [entryPath, entry] of mockFileEntries) {
+            if (entryPath !== directoryPath && path.win32.dirname(entryPath) === directoryPath) {
+                children.push([path.win32.basename(entryPath), entry.type]);
+            }
+        }
+        return children;
+    },
+    async createDirectory(): Promise<void> {},
+    async writeFile(): Promise<void> {},
+    async delete(): Promise<void> {},
+};
+
 class MockEventEmitter {
     readonly event = () => undefined;
     fire(): void {}
@@ -100,13 +169,20 @@ Module._load = function (request: string, parent: unknown, isMain: boolean): unk
             FileSystemError: MockFileSystemError,
             FileType: { File: 1, Directory: 2 },
             Uri: {
-                joinPath: (...parts: Array<{ toString(): string } | string>) =>
-                    parts.map(part => String(part)).join('/'),
+                joinPath: (
+                    base: MockUri | string,
+                    ...segments: string[]
+                ): MockUri | string => typeof base === 'string'
+                    ? [base, ...segments].join('/')
+                    : mockFileUri(path.win32.join(base.fsPath, ...segments)),
             },
             commands: {
                 executeCommand: (...args: unknown[]) => executeCommandImpl(...args),
             },
-            workspace: { fs: {} },
+            workspace: {
+                get workspaceFolders() { return mockWorkspaceFolders; },
+                fs: mockWorkspaceFs,
+            },
         };
     }
     if (request === '../api/socketio') {
@@ -445,12 +521,18 @@ async function run(): Promise<void> {
         asWebviewUri: () => 'vscode-webview-test:/icon.svg',
     };
     const { ProjectsWebviewProvider } = require(path.join('..', 'views', 'projectsWebviewProvider')) as {
-        ProjectsWebviewProvider: { prototype: object };
+        ProjectsWebviewProvider: any;
     };
     const projectsProvider = Object.create(ProjectsWebviewProvider.prototype) as any;
     projectsProvider.extensionUri = 'extension';
     const projectsHtml = projectsProvider.getHtml(mockWebview);
     assert.match(projectsHtml, /split\(\/\\s\+\/\)/, 'project initials must split on whitespace');
+    assert.match(projectsHtml, /openLocalProject/, 'detected local projects must be openable from the panel');
+    assert.match(projectsHtml, /ArrowDown/, 'project lists must support keyboard navigation');
+    assert.match(projectsHtml, /aria-label', 'Detected LocalLeaf projects'/,
+        'the detected-project list must have an accessible name');
+    assert.match(projectsHtml, /state\.workspaceKind === 'invalid-config'/,
+        'invalid LocalLeaf configuration must have a dedicated warning state');
 
     let finishOpenProject: (() => void) | undefined;
     let openProjectCalls = 0;
@@ -470,13 +552,79 @@ async function run(): Promise<void> {
     assert.equal(projectsProvider.state.openingProjectId, undefined, 'the project action must unlock after completion');
     executeCommandImpl = async () => undefined;
 
-    const { MainWebviewProvider } = require(path.join('..', 'views', 'mainWebviewProvider')) as {
-        MainWebviewProvider: { prototype: object };
+    const { MainWebviewProvider, statusDescription, shouldShowChangesTab } = require(
+        path.join('..', 'views', 'mainWebviewProvider')
+    ) as {
+        MainWebviewProvider: any;
+        statusDescription(status: string): string;
+        shouldShowChangesTab(syncMode: 'realtime' | 'manual'): boolean;
     };
     const mainProvider = Object.create(MainWebviewProvider.prototype) as any;
     mainProvider.extensionUri = 'extension';
     const mainHtml = mainProvider.getHtml(mockWebview);
     assert.match(mainHtml, /split\(\/\\s\+\/\)/, 'collaborator initials must split on whitespace');
+    assert.match(mainHtml, /role="tablist"/, 'main navigation must expose ARIA tab semantics');
+    assert.match(mainHtml, /ArrowRight/, 'main tabs must support keyboard navigation');
+    assert.match(mainHtml, /aria-modal', 'true'/, 'dangerous actions must use an accessible modal dialog');
+    assert.match(mainHtml, /event\.key === 'Escape'/, 'confirmation dialogs must support Escape');
+    assert.equal(shouldShowChangesTab('realtime'), false,
+        'the placeholder Changes tab must stay hidden during real-time synchronization');
+    assert.equal(shouldShowChangesTab('manual'), true,
+        'manual synchronization can expose the Changes surface later');
+    assert.deepStrictEqual(
+        ['disconnected', 'connecting', 'idle', 'syncing', 'pulling', 'pushing', 'error']
+            .map(status => statusDescription(status)),
+        [
+            'Disconnected',
+            'Connecting\u2026',
+            'Up to date',
+            'Synchronizing\u2026',
+            'Pulling from Overleaf\u2026',
+            'Pushing to Overleaf\u2026',
+            'Synchronization error',
+        ],
+        'every synchronization state must have user-facing text',
+    );
+
+    const noticeProvider = Object.create(MainWebviewProvider.prototype) as any;
+    noticeProvider.syncStatus = 'idle';
+    noticeProvider.onlineUsers = [];
+    noticeProvider.state = {
+        linked: true,
+        syncStatus: 'idle',
+        statusText: 'Up to date',
+        syncMode: 'realtime',
+        showChanges: false,
+        details: [],
+        onlineUsers: [],
+        signedIn: true,
+        mainDocumentSelected: true,
+    };
+    noticeProvider.setSyncStatus('connecting', 'Connecting to Overleaf...');
+    assert.deepStrictEqual(noticeProvider.state.notice, {
+        kind: 'info',
+        message: 'Connecting to Overleaf...',
+    });
+    noticeProvider.setSyncStatus('error', 'Connection failed');
+    assert.equal(noticeProvider.state.notice.actionLabel, 'Retry sync',
+        'authenticated sync failures should offer a retry instead of an unrelated login action');
+
+    const confirmedCommands: string[] = [];
+    const confirmedCommandProvider = new MainWebviewProvider(
+        'extension',
+        {},
+        async (command: string) => { confirmedCommands.push(command); },
+    ) as any;
+    await confirmedCommandProvider.handleMessage({
+        type: 'runConfirmedCommand',
+        command: 'localleaf.cleanIgnoredRemoteFiles',
+    });
+    await confirmedCommandProvider.handleMessage({
+        type: 'runConfirmedCommand',
+        command: 'localleaf.syncNow',
+    });
+    assert.deepStrictEqual(confirmedCommands, ['localleaf.cleanIgnoredRemoteFiles'],
+        'only explicitly dangerous panel actions may use the panel-confirmed path');
 
     let postedStates = 0;
     mainProvider.onlineUsers = [];
@@ -582,10 +730,20 @@ async function run(): Promise<void> {
         path.join('..', 'utils', 'settingsManager')
     ) as {
         SettingsManager: {
+            clearCurrentWorkspaceFolder(): void;
             createDefaultSettings(serverUrl: string, projectId: string, projectName: string): {
                 mainTex?: string;
                 mainPdf?: string;
             };
+            findLinkedProjectFolders(): Promise<Array<{
+                uri: MockUri;
+                relativePath: string;
+                settings: { projectId: string; projectName: string };
+            }>>;
+            inspectFolder(uri: MockUri): Promise<{ kind: string }>;
+            resolveCurrentInstance(): Promise<{
+                getWorkspaceFolder(): MockUri;
+            } | undefined>;
         };
         isValidProjectSettings(value: unknown): boolean;
     };
@@ -609,6 +767,105 @@ async function run(): Promise<void> {
         projectName: 'Project',
         mainTex: 42,
     }), false, 'invalid optional values must not pass the stored-settings validator');
+
+    const linkedSettings = JSON.stringify({
+        serverUrl: 'https://overleaf.example',
+        projectId: 'detected-project-id',
+        projectName: 'Detected Project',
+        autoSync: true,
+    });
+    const workspaceRoot = mockFileUri('D:\\workspace');
+    resetMockWorkspace([workspaceRoot], [
+        ['D:\\workspace', { type: 2 }],
+        ['D:\\workspace\\.localleaf', { type: 2 }],
+        ['D:\\workspace\\.localleaf\\settings.json', { type: 1, content: linkedSettings }],
+    ]);
+    SettingsManager.clearCurrentWorkspaceFolder();
+    const resolvedManager = await SettingsManager.resolveCurrentInstance();
+    assert.equal(resolvedManager?.getWorkspaceFolder().toString(), workspaceRoot.toString(),
+        'activation must restore a valid LocalLeaf project already open as a workspace root');
+    assert.equal((await SettingsManager.inspectFolder(workspaceRoot)).kind, 'linked');
+
+    resetMockWorkspace([workspaceRoot], [
+        ['D:\\workspace', { type: 2 }],
+        ['D:\\workspace\\project-a', { type: 2 }],
+        ['D:\\workspace\\project-a\\.localleaf', { type: 2 }],
+        ['D:\\workspace\\project-a\\.localleaf\\settings.json', { type: 1, content: linkedSettings }],
+    ]);
+    SettingsManager.clearCurrentWorkspaceFolder();
+    assert.equal((await SettingsManager.inspectFolder(workspaceRoot)).kind, 'non-empty');
+    const detectedProjects = await SettingsManager.findLinkedProjectFolders();
+    assert.equal(detectedProjects.length, 1, 'one-level LocalLeaf projects must be discovered');
+    assert.equal(detectedProjects[0].relativePath, 'project-a');
+    assert.equal(detectedProjects[0].settings.projectId, 'detected-project-id');
+
+    const noCredentialManager = {
+        getDefaultServer: () => 'https://overleaf.example',
+        getCredential: async () => undefined,
+    };
+    const detectedProjectsProvider = new ProjectsWebviewProvider(
+        'extension',
+        noCredentialManager,
+    ) as any;
+    await detectedProjectsProvider.refresh();
+    assert.equal(detectedProjectsProvider.state.status, 'local-projects');
+    assert.equal(detectedProjectsProvider.state.localProjects[0].projectName, 'Detected Project');
+    let openLocalProjectArgs: unknown[] | undefined;
+    executeCommandImpl = async (...args: unknown[]) => {
+        openLocalProjectArgs = args;
+        return undefined;
+    };
+    await detectedProjectsProvider.handleMessage({
+        type: 'openLocalProject',
+        uri: detectedProjects[0].uri.toString(),
+    });
+    assert.equal(openLocalProjectArgs?.[0], 'vscode.openFolder');
+    assert.equal((openLocalProjectArgs?.[1] as MockUri).toString(), detectedProjects[0].uri.toString());
+    assert.equal(openLocalProjectArgs?.[2], false,
+        'opening a detected project should reuse the Extension Development Host window');
+    executeCommandImpl = async () => undefined;
+
+    resetMockWorkspace([workspaceRoot], [
+        ['D:\\workspace', { type: 2 }],
+        ['D:\\workspace\\.leafignore', { type: 1, content: '*.aux' }],
+    ]);
+    assert.equal((await SettingsManager.inspectFolder(workspaceRoot)).kind, 'empty',
+        '.leafignore alone must not make a workspace unsafe to link');
+    const emptyFolderProvider = new ProjectsWebviewProvider('extension', noCredentialManager) as any;
+    await emptyFolderProvider.refresh();
+    assert.equal(emptyFolderProvider.state.status, 'not-logged-in');
+    assert.equal(emptyFolderProvider.state.workspaceKind, 'empty');
+
+    resetMockWorkspace([workspaceRoot], [
+        ['D:\\workspace', { type: 2 }],
+        ['D:\\workspace\\.localleaf', { type: 2 }],
+        ['D:\\workspace\\.localleaf\\settings.json', { type: 1, content: '{"projectId":42}' }],
+    ]);
+    assert.equal((await SettingsManager.inspectFolder(workspaceRoot)).kind, 'invalid-config');
+    const invalidFolderProvider = new ProjectsWebviewProvider('extension', noCredentialManager) as any;
+    await invalidFolderProvider.refresh();
+    assert.equal(invalidFolderProvider.state.status, 'not-logged-in');
+    assert.equal(invalidFolderProvider.state.workspaceKind, 'invalid-config');
+
+    const virtualWorkspace: MockUri = {
+        scheme: 'vscode-remote',
+        path: '/workspace',
+        fsPath: '',
+        toString: () => 'vscode-remote://workspace',
+    };
+    resetMockWorkspace([virtualWorkspace]);
+    assert.equal((await SettingsManager.inspectFolder(virtualWorkspace)).kind, 'unsupported');
+    const incompatibleFolderProvider = new ProjectsWebviewProvider(
+        'extension',
+        noCredentialManager,
+    ) as any;
+    await incompatibleFolderProvider.refresh();
+    assert.equal(incompatibleFolderProvider.state.status, 'incompatible-folder');
+
+    resetMockWorkspace();
+    const noFolderProvider = new ProjectsWebviewProvider('extension', noCredentialManager) as any;
+    await noFolderProvider.refresh();
+    assert.equal(noFolderProvider.state.status, 'no-folder');
 
     const { IgnoreParser } = require(path.join('..', 'sync', 'ignoreParser')) as {
         IgnoreParser: { prototype: object };

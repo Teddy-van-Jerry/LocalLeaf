@@ -21,7 +21,14 @@ interface FileCache {
 /**
  * Sync status
  */
-export type SyncStatus = 'idle' | 'syncing' | 'pulling' | 'pushing' | 'error' | 'disconnected';
+export type SyncStatus =
+    | 'disconnected'
+    | 'connecting'
+    | 'idle'
+    | 'syncing'
+    | 'pulling'
+    | 'pushing'
+    | 'error';
 
 /**
  * Sync status change event
@@ -178,7 +185,7 @@ export class SyncEngine {
             throw new Error('Project not configured');
         }
 
-        this.setStatus('syncing', 'Connecting...');
+        this.setStatus('connecting', 'Connecting...');
 
         // Load ignore patterns
         await this.ignoreParser.load();
@@ -222,7 +229,7 @@ export class SyncEngine {
 
         // HTTP fallback - use REST API instead of socket.io
         if (useHttpFallback) {
-            this.setStatus('syncing', 'Connecting via HTTP...');
+            this.setStatus('connecting', 'Connecting via HTTP...');
             this.socket = undefined;
 
             try {
