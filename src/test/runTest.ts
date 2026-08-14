@@ -530,6 +530,31 @@ async function run(): Promise<void> {
     assert.ok(cookieHandler >= 0 && cookieClear > cookieHandler && cookieClear < cookiePost,
         'session cookies must be removed from the DOM before the login message is posted');
 
+    const extensionSource = fs.readFileSync(
+        path.join(__dirname, '..', '..', 'src', 'extension.ts'),
+        'utf8',
+    );
+    const cookieLoginStart = extensionSource.indexOf('async function loginWithCookies');
+    const cookieLoginEnd = extensionSource.indexOf('// === Command Implementations ===', cookieLoginStart);
+    const cookieLoginSource = extensionSource.slice(cookieLoginStart, cookieLoginEnd);
+    const insecureWarning = cookieLoginSource.indexOf('showWarningMessage');
+    const cookieApiCreation = cookieLoginSource.indexOf('new BaseAPI');
+    assert.ok(cookieLoginStart >= 0 && cookieLoginEnd > cookieLoginStart);
+    assert.match(cookieLoginSource, /parsed\.protocol === 'http:'/);
+    assert.match(cookieLoginSource, /modal:\s*true/);
+    assert.ok(insecureWarning >= 0 && insecureWarning < cookieApiCreation,
+        'HTTP cookie login must require a modal warning before any API request');
+    assert.match(extensionSource, /if \(await loginWithCookies[\s\S]*await reconnectAfterLogin\(\)/,
+        'cancelling the HTTP warning must also skip reconnecting');
+
+    const projectsSource = fs.readFileSync(
+        path.join(__dirname, '..', '..', 'src', 'views', 'projectsWebviewProvider.ts'),
+        'utf8',
+    );
+    assert.match(projectsSource, /Preparing synchronization\.\.\./);
+    assert.doesNotMatch(projectsSource, /Ã|â€¦/,
+        'project loading text must not contain mojibake');
+
     const { LinkOperationGate, shouldConfirmProjectLink } = require(
         path.join('..', 'utils', 'linkSafety')
     ) as {

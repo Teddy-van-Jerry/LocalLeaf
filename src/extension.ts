@@ -504,8 +504,9 @@ async function handleAccountPanelAction(action: AccountPanelAction): Promise<voi
             await reconnectAfterLogin();
             break;
         case 'loginCookies':
-            await loginWithCookies(action.serverUrl, action.cookies);
-            await reconnectAfterLogin();
+            if (await loginWithCookies(action.serverUrl, action.cookies)) {
+                await reconnectAfterLogin();
+            }
             break;
         case 'logout':
             await cmdLogout();
@@ -527,11 +528,26 @@ async function reconnectAfterLogin(): Promise<void> {
     await cmdReconnect();
 }
 
-async function loginWithCookies(serverUrl: string, cookies: string): Promise<void> {
-    const normalizedServer = serverUrl.replace(/\/+$/, '');
+async function loginWithCookies(serverUrl: string, cookies: string): Promise<boolean> {
+    const normalizedServer = serverUrl.trim().replace(/\/+$/, '');
     const parsed = new URL(normalizedServer);
     if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
         throw new Error('The Overleaf server must use HTTP or HTTPS.');
+    }
+
+    if (parsed.protocol === 'http:') {
+        const continueAction = 'Continue with HTTP';
+        const choice = await vscode.window.showWarningMessage(
+            'LocalLeaf: This server uses unencrypted HTTP. Your Overleaf session cookie could be intercepted.',
+            {
+                modal: true,
+                detail: `Server: ${parsed.origin}\n\nContinue only if you trust this server and network.`,
+            },
+            continueAction,
+        );
+        if (choice !== continueAction) {
+            return false;
+        }
     }
 
     const api = new BaseAPI(normalizedServer);
@@ -558,6 +574,7 @@ async function loginWithCookies(serverUrl: string, cookies: string): Promise<voi
     );
     await setAuthState('valid');
     vscode.window.showInformationMessage(`LocalLeaf: Logged in as ${result.userInfo.userEmail}`);
+    return true;
 }
 
 // === Command Implementations ===

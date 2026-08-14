@@ -326,7 +326,7 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
                     const badge = element('span', 'project-icon', initials(project.name));
                     const copy = element('span', 'project-copy');
                     const date = state.openingProjectId === project.id
-                        ? 'Preparing synchronizationâ€¦'
+                        ? 'Preparing synchronization...'
                         : project.lastUpdated ? new Date(project.lastUpdated).toLocaleDateString() : 'No update date';
                     copy.append(element('div', 'project-name', project.name), element('div', 'project-detail', date));
                     row.append(badge, copy, element('span', 'access', project.accessLevel));
