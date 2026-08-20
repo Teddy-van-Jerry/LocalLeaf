@@ -4,24 +4,33 @@
  */
 
 import * as vscode from 'vscode';
+import { createHash } from 'crypto';
 import { BaseAPI, ProjectEntity, FileEntity, FolderEntity } from '../api/base';
 import { SocketIOAPI, DocumentUpdate } from '../api/socketio';
-import { SettingsManager, ProjectSettings } from '../utils/settingsManager';
-import { IgnoreParser } from './ignoreParser';
+import { SettingsManager } from '../utils/settingsManager';
+import { createIgnoreWatcher, IgnoreParser } from './ignoreParser';
 import { DEBOUNCE_DELAY } from '../consts';
+import {
+    assertSafeWorkspacePath,
+    isFileNotFoundError,
+    joinProjectPath,
+    normalizeProjectPath,
+    validateProjectEntityName,
+} from '../utils/pathSafety';
 
-/**
- * File cache entry for change detection
- */
-interface FileCache {
-    hash: number;
-    timestamp: number;
-}
+const MAX_DOCUMENT_CHARACTERS = 10 * 1024 * 1024;
 
 /**
  * Sync status
  */
-export type SyncStatus = 'idle' | 'syncing' | 'pulling' | 'pushing' | 'error' | 'disconnected';
+export type SyncStatus =
+    | 'disconnected'
+    | 'connecting'
+    | 'idle'
+    | 'syncing'
+    | 'pulling'
+    | 'pushing'
+    | 'error';
 
 /**
  * Sync status change event
@@ -36,33 +45,9 @@ export interface SyncStatusEvent {
 /**
  * Hash function for content comparison
  */
-function hashContent(content: Uint8Array | undefined): number {
-    if (!content) return -1;
-    const str = new TextDecoder().decode(content);
-    let hash = 0;
-    for (let i = 0; i < str.length; i++) {
-        const chr = str.charCodeAt(i);
-        hash = (hash << 5) - hash + chr;
-        hash |= 0;
-    }
-    return hash;
-}
-
-/**
- * Check if an error is a FileNotFound error (race condition safe)
- * This handles the case where a file is deleted between the watcher event and the read
- */
-function isFileNotFoundError(error: unknown): boolean {
-    if (error instanceof vscode.FileSystemError) {
-        // VS Code FileSystemError has a 'code' property
-        return error.code === 'FileNotFound' || error.code === 'EntryNotFound';
-    }
-    // Also check error message as fallback
-    if (error instanceof Error) {
-        const msg = error.message.toLowerCase();
-        return msg.includes('entrynotfound') || msg.includes('filenotfound') || msg.includes('enoent');
-    }
-    return false;
+function hashContent(content: Uint8Array | undefined): string {
+    if (!content) return 'missing';
+    return createHash('sha256').update(content).digest('hex');
 }
 
 /**
@@ -106,6 +91,13 @@ function ensureApiSuccess(result: { type: 'success' | 'error'; message?: string 
     }
 }
 
+function validateOpaqueId(value: unknown, label: string): string {
+    if (typeof value !== 'string' || value.length === 0 || value.length > 1024 || /[\0\r\n]/.test(value)) {
+        throw new Error(`Invalid Overleaf ${label}.`);
+    }
+    return value;
+}
+
 /**
  * File entry in the project tree
  */
@@ -123,10 +115,9 @@ interface FileTreeEntry {
 export class SyncEngine {
     private socket?: SocketIOAPI;
     private project?: ProjectEntity;
-    private localWatcher?: vscode.FileSystemWatcher;
     private fileTree: Map<string, FileTreeEntry> = new Map();
     private fileTreeByPath: Map<string, FileTreeEntry> = new Map();
-    private fileCache: Map<string, FileCache> = new Map();
+    private fileCache: Map<string, string> = new Map();
     private baseContent: Map<string, Uint8Array> = new Map();
     private ignoreParser: IgnoreParser;
     private _status: SyncStatus = 'disconnected';
@@ -136,7 +127,13 @@ export class SyncEngine {
     private joinedDocs: Set<string> = new Set();
     private suppressedRemoteDeletes: Set<string> = new Set();
     private suppressedRemoteRenames: Map<string, Set<string>> = new Map();
+    private suppressedRemoteDocumentUpdates: Map<string, Set<string>> = new Map();
     private logFn?: (message: string) => void;
+    private disposed = false;
+    private readonly pendingWaits = new Map<NodeJS.Timeout, (active: boolean) => void>();
+    private remoteEventQueue: Promise<void> = Promise.resolve();
+    private readonly remoteDiffContents = new Map<string, string>();
+    private remoteDiffChangeEmitter?: vscode.EventEmitter<vscode.Uri>;
 
     readonly onStatusChange = this._onStatusChange.event;
 
@@ -165,20 +162,49 @@ export class SyncEngine {
      * Set status and emit event
      */
     private setStatus(status: SyncStatus, message?: string, file?: string, authError: boolean = false): void {
+        if (this.disposed && status !== 'disconnected') return;
         this._status = status;
         this._onStatusChange.fire({ status, message, file, authError });
+    }
+
+    private throwIfDisposed(): void {
+        if (this.disposed) {
+            throw new Error('LocalLeaf sync session was closed.');
+        }
+    }
+
+    private enqueueRemoteEvent(operation: () => Promise<void>): void {
+        this.remoteEventQueue = this.remoteEventQueue
+            .then(async () => {
+                if (!this.disposed) await operation();
+            })
+            .catch(error => {
+                if (!this.disposed) {
+                    console.error('[LocalLeaf] Failed to process a remote synchronization event:', error);
+                    const authErr = isAuthError(error);
+                    this.setStatus(
+                        'error',
+                        authErr ? 'Session expired' : `Remote synchronization failed: ${error}`,
+                        undefined,
+                        authErr,
+                    );
+                }
+            });
     }
 
     /**
      * Initialize and connect to Overleaf
      */
     async connect(): Promise<void> {
+        this.throwIfDisposed();
         const projectSettings = this.settings.getSettings();
         if (!projectSettings) {
             throw new Error('Project not configured');
         }
 
-        this.setStatus('syncing', 'Connecting...');
+        this.setStatus('connecting', 'Connecting...');
+
+        await this.assertNoSymbolicLinks(this.settings.getWorkspaceFolder());
 
         // Load ignore patterns
         await this.ignoreParser.load();
@@ -204,11 +230,24 @@ export class SyncEngine {
                         this.setStatus('disconnected', 'Disconnected');
                     }
                 },
-                onFileCreated: (parentId, type, entity) => this.handleRemoteFileCreated(parentId, type, entity),
-                onFileRenamed: (entityId, newName) => this.handleRemoteFileRenamed(entityId, newName),
-                onFileRemoved: (entityId) => this.handleRemoteFileRemoved(entityId),
-                onFileMoved: (entityId, newParentId) => this.handleRemoteFileMoved(entityId, newParentId),
-                onFileChanged: (update) => this.handleRemoteFileChanged(update),
+                onFileCreated: (parentId, type, entity) => this.enqueueRemoteEvent(
+                    () => this.handleRemoteFileCreated(parentId, type, entity)
+                ),
+                onFileRenamed: (entityId, newName) => this.enqueueRemoteEvent(
+                    () => this.handleRemoteFileRenamed(entityId, newName)
+                ),
+                onFileRemoved: (entityId) => this.enqueueRemoteEvent(
+                    () => this.handleRemoteFileRemoved(entityId)
+                ),
+                onFileMoved: (entityId, newParentId) => this.enqueueRemoteEvent(
+                    () => this.handleRemoteFileMoved(entityId, newParentId)
+                ),
+                onFileChanged: (update) => this.enqueueRemoteEvent(
+                    () => this.handleRemoteFileChanged(update)
+                ),
+                onRootDocUpdated: (rootDocId) => this.enqueueRemoteEvent(
+                    () => this.handleRootDocumentUpdated(rootDocId)
+                ),
             });
 
             // Join project via socket.io
@@ -217,12 +256,13 @@ export class SyncEngine {
             this.setStatus('idle', 'Connected (real-time)');
         } catch (error) {
             debugLog('Socket.io failed, using HTTP fallback:', error);
+            this.socket?.disconnect();
             useHttpFallback = true;
         }
 
         // HTTP fallback - use REST API instead of socket.io
         if (useHttpFallback) {
-            this.setStatus('syncing', 'Connecting via HTTP...');
+            this.setStatus('connecting', 'Connecting via HTTP...');
             this.socket = undefined;
 
             try {
@@ -248,21 +288,9 @@ export class SyncEngine {
                     };
                     this.buildFileTree(this.project);
                 } else {
-                    // Fallback: get entities list and build minimal tree
-                    const entitiesResult = await this.api.getProjectEntities(projectSettings.projectId);
-                    if (entitiesResult.type === 'success' && entitiesResult.entities) {
-                        // Create minimal project object for HTTP-only mode
-                        this.project = {
-                            _id: projectSettings.projectId,
-                            name: projectSettings.projectName || 'Unknown',
-                            rootDoc_id: undefined,
-                            rootFolder: [],
-                            compiler: 'pdflatex',
-                            owner: { _id: '', email: '', first_name: 'Unknown' },
-                            members: [],
-                        };
-                        this.buildFileTreeFromEntities(entitiesResult.entities);
-                    }
+                    throw new Error(
+                        'HTTP synchronization is unavailable because the server returned no folder identity metadata.'
+                    );
                 }
 
                 this.setStatus('idle', 'Connected (HTTP mode)');
@@ -274,35 +302,16 @@ export class SyncEngine {
         }
 
         // Setup local file watcher
+        this.throwIfDisposed();
         this.setupLocalWatcher();
-    }
-
-    /**
-     * Build file tree from entities list (HTTP fallback)
-     */
-    private buildFileTreeFromEntities(entities: Array<{ path: string; type: string }>): void {
-        this.fileTree.clear();
-        this.fileTreeByPath.clear();
-
-        for (const entity of entities) {
-            const path = '/' + entity.path;
-            const name = path.split('/').pop() || '';
-            const parentPath = path.substring(0, path.lastIndexOf('/') + 1) || '/';
-
-            // Generate a pseudo-ID based on path (since we don't have real IDs)
-            const id = Buffer.from(path).toString('base64').replace(/[^a-zA-Z0-9]/g, '').substring(0, 24);
-
-            const entry: FileTreeEntry = {
-                id,
-                type: entity.type === 'folder' ? 'folder' : (entity.type === 'doc' ? 'doc' : 'file'),
-                name,
-                path: entity.type === 'folder' ? path + '/' : path,
-                parentId: undefined, // We don't have parent IDs in this mode
-            };
-
-            this.fileTree.set(id, entry);
-            this.fileTreeByPath.set(entry.path, entry);
-        }
+        const ignoreWatcher = createIgnoreWatcher(this.settings.getWorkspaceFolder(), () => {
+            void this.ignoreParser.load().catch(error => {
+                if (!this.disposed) {
+                    this.setStatus('error', `Failed to reload .leafignore: ${error}`);
+                }
+            });
+        });
+        this.disposables.push(ignoreWatcher);
     }
 
     /**
@@ -315,73 +324,104 @@ export class SyncEngine {
         this.fileTree.clear();
         this.fileTreeByPath.clear();
 
-        const traverse = (folder: FolderEntity, parentPath: string, parentId?: string, isRoot: boolean = false) => {
+        let entityCount = 0;
+        const addEntry = (entry: FileTreeEntry) => {
+            entityCount++;
+            if (entityCount > 100_000) {
+                throw new Error('Overleaf project contains too many entities.');
+            }
+            if (this.fileTree.has(entry.id)) {
+                throw new Error(`Overleaf returned duplicate entity ID: ${entry.id}`);
+            }
+            if (this.fileTreeByPath.has(entry.path)) {
+                throw new Error(`Overleaf returned duplicate entity path: ${entry.path}`);
+            }
+            this.fileTree.set(entry.id, entry);
+            this.fileTreeByPath.set(entry.path, entry);
+        };
+        const childEntities = (value: unknown, label: string): FileEntity[] => {
+            if (value === undefined) return [];
+            if (!Array.isArray(value)) throw new Error(`Overleaf returned invalid ${label}.`);
+            return value as FileEntity[];
+        };
+
+        const traverse = (
+            folder: FolderEntity,
+            parentPath: string,
+            parentId?: string,
+            isRoot: boolean = false,
+            depth: number = 0,
+        ) => {
+            if (!folder || typeof folder !== 'object' || depth > 256) {
+                throw new Error('Overleaf returned an invalid or excessively deep folder tree.');
+            }
+            const folderId = validateOpaqueId(folder._id, 'folder ID');
             // For root folder, don't add the folder itself, just its contents at /
-            const folderPath = isRoot ? '/' : parentPath + folder.name + '/';
+            const folderPath = isRoot ? '/' : joinProjectPath(parentPath, folder.name, true);
 
             // Add folder entry (skip for root folder)
             if (!isRoot) {
                 const folderEntry: FileTreeEntry = {
-                    id: folder._id,
+                    id: folderId,
                     type: 'folder',
                     name: folder.name,
                     path: folderPath,
                     parentId,
                 };
-                this.fileTree.set(folder._id, folderEntry);
-                this.fileTreeByPath.set(folderPath, folderEntry);
+                addEntry(folderEntry);
             } else {
                 // Store root folder ID for reference
                 const rootEntry: FileTreeEntry = {
-                    id: folder._id,
+                    id: folderId,
                     type: 'folder',
                     name: '',
                     path: '/',
                     parentId: undefined,
                 };
-                this.fileTree.set(folder._id, rootEntry);
-                this.fileTreeByPath.set('/', rootEntry);
+                addEntry(rootEntry);
             }
 
             // Add docs
-            for (const doc of folder.docs || []) {
-                const docPath = folderPath + doc.name;
+            for (const doc of childEntities(folder.docs, 'document list')) {
+                const docPath = joinProjectPath(folderPath, doc.name, false);
+                const docId = validateOpaqueId(doc._id, 'document ID');
                 const entry: FileTreeEntry = {
-                    id: doc._id,
+                    id: docId,
                     type: 'doc',
                     name: doc.name,
                     path: docPath,
-                    parentId: folder._id,
+                    parentId: folderId,
                 };
-                this.fileTree.set(doc._id, entry);
-                this.fileTreeByPath.set(docPath, entry);
+                addEntry(entry);
                 debugLog('buildFileTree: Added doc', docPath);
             }
 
             // Add file refs
-            for (const file of folder.fileRefs || []) {
-                const filePath = folderPath + file.name;
+            for (const file of childEntities(folder.fileRefs, 'file list')) {
+                const filePath = joinProjectPath(folderPath, file.name, false);
+                const fileId = validateOpaqueId(file._id, 'file ID');
                 const entry: FileTreeEntry = {
-                    id: file._id,
+                    id: fileId,
                     type: 'file',
                     name: file.name,
                     path: filePath,
-                    parentId: folder._id,
+                    parentId: folderId,
                 };
-                this.fileTree.set(file._id, entry);
-                this.fileTreeByPath.set(filePath, entry);
+                addEntry(entry);
                 debugLog('buildFileTree: Added file', filePath);
             }
 
             // Recurse into subfolders
-            for (const subfolder of folder.folders || []) {
-                traverse(subfolder as FolderEntity, folderPath, folder._id, false);
+            for (const subfolder of childEntities(folder.folders, 'folder list')) {
+                traverse(subfolder as FolderEntity, folderPath, folderId, false, depth + 1);
             }
         };
 
         // Start from root folder - treat it as root (don't include its name in paths)
-        if (project.rootFolder && project.rootFolder.length > 0) {
+        if (Array.isArray(project.rootFolder) && project.rootFolder.length > 0) {
             traverse(project.rootFolder[0], '', undefined, true);
+        } else {
+            throw new Error('Overleaf returned no valid root folder.');
         }
 
         debugLog('buildFileTree: Total entries:', this.fileTree.size);
@@ -399,7 +439,8 @@ export class SyncEngine {
         const mainTex = rootDocEntry.path.startsWith('/')
             ? rootDocEntry.path.slice(1)  // Remove leading slash
             : rootDocEntry.path;
-        const mainPdf = mainTex.replace(/\.tex$/, '.pdf');
+        if (!mainTex.toLowerCase().endsWith('.tex')) return;
+        const mainPdf = mainTex.replace(/\.tex$/i, '.pdf');
 
         const currentSettings = this.settings.getSettings();
         if (currentSettings && (currentSettings.mainTex !== mainTex || currentSettings.mainPdf !== mainPdf)) {
@@ -416,13 +457,28 @@ export class SyncEngine {
         const workspaceFolder = this.settings.getWorkspaceFolder();
         const pattern = new vscode.RelativePattern(workspaceFolder, '**/*');
 
-        this.localWatcher = vscode.workspace.createFileSystemWatcher(pattern);
+        const localWatcher = vscode.workspace.createFileSystemWatcher(pattern);
+
+        const run = (operation: Promise<void>) => {
+            void operation.catch(error => {
+                if (!this.disposed) {
+                    console.error('[LocalLeaf] Local filesystem event failed:', error);
+                    const authErr = isAuthError(error);
+                    this.setStatus(
+                        'error',
+                        authErr ? 'Session expired' : `Local synchronization failed: ${error}`,
+                        undefined,
+                        authErr,
+                    );
+                }
+            });
+        };
 
         this.disposables.push(
-            this.localWatcher.onDidChange(uri => this.handleLocalFileChange(uri)),
-            this.localWatcher.onDidCreate(uri => this.handleLocalFileCreate(uri)),
-            this.localWatcher.onDidDelete(uri => this.handleLocalFileDelete(uri)),
-            this.localWatcher
+            localWatcher.onDidChange(uri => run(this.handleLocalFileChange(uri))),
+            localWatcher.onDidCreate(uri => run(this.handleLocalFileCreate(uri))),
+            localWatcher.onDidDelete(uri => run(this.handleLocalFileDelete(uri))),
+            localWatcher
         );
     }
 
@@ -430,31 +486,53 @@ export class SyncEngine {
      * Get relative path from URI
      */
     private getRelativePath(uri: vscode.Uri): string {
-        const workspacePath = this.settings.getWorkspaceFolder().path;
-        return uri.path.slice(workspacePath.length);
+        const relativePath = this.settings.getRelativePath(uri);
+        if (!relativePath || relativePath === '/') {
+            throw new Error(`Refusing to synchronize a path outside the workspace: ${uri.toString()}`);
+        }
+        return normalizeProjectPath(relativePath, false);
+    }
+
+    private async assertNoSymbolicLinks(uri: vscode.Uri): Promise<void> {
+        await assertSafeWorkspacePath(this.settings.getWorkspaceFolder(), uri);
     }
 
     /**
      * Check if path should be synced (not ignored)
      */
     private shouldSync(relativePath: string): boolean {
+        const normalized = normalizeProjectPath(relativePath).toLowerCase();
+        if (
+            normalized === '/.leafignore'
+            || normalized === '/.localleaf'
+            || normalized === '/.localleaf/'
+            || normalized.startsWith('/.localleaf/')
+            || normalized === '/.git'
+            || normalized === '/.git/'
+            || normalized.startsWith('/.git/')
+            || normalized === '/.vscode'
+            || normalized === '/.vscode/'
+            || normalized.startsWith('/.vscode/')
+        ) {
+            return false;
+        }
         return !this.ignoreParser.shouldIgnore(relativePath);
     }
 
     /**
      * Check if we should propagate a change (prevent echo)
      */
-    private shouldPropagate(action: 'push' | 'pull', path: string, content?: Uint8Array): boolean {
+    private shouldPropagate(path: string, content?: Uint8Array): boolean {
         const cache = this.fileCache.get(path);
         const newHash = hashContent(content);
 
         // Only identical content is an echo. Editors often emit an empty
         // create/change event followed immediately by the actual contents.
-        if (cache && cache.hash === newHash) {
+        if (cache === newHash) {
             return false;
         }
 
-        this.fileCache.set(path, { hash: newHash, timestamp: Date.now() });
+        this.fileCache.set(path, newHash);
         return true;
     }
 
@@ -462,7 +540,13 @@ export class SyncEngine {
      * Acquire sync lock for a path
      */
     private acquireLock(path: string): boolean {
-        if (this.syncLock.has(path)) {
+        if (this.disposed) return false;
+        const pathPrefix = path.endsWith('/') ? path : `${path}/`;
+        const overlapsExistingLock = [...this.syncLock].some(lockedPath => {
+            const lockedPrefix = lockedPath.endsWith('/') ? lockedPath : `${lockedPath}/`;
+            return lockedPath === path || lockedPath.startsWith(pathPrefix) || path.startsWith(lockedPrefix);
+        });
+        if (overlapsExistingLock) {
             return false;
         }
         this.syncLock.add(path);
@@ -474,6 +558,34 @@ export class SyncEngine {
      */
     private releaseLock(path: string): void {
         this.syncLock.delete(path);
+    }
+
+    private waitForRetry(): Promise<boolean> {
+        if (this.disposed) return Promise.resolve(false);
+        return new Promise(resolve => {
+            const timer = setTimeout(() => {
+                this.pendingWaits.delete(timer);
+                resolve(!this.disposed);
+            }, DEBOUNCE_DELAY);
+            this.pendingWaits.set(timer, resolve);
+        });
+    }
+
+    private async acquireLockWhenAvailable(path: string): Promise<boolean> {
+        while (!this.disposed) {
+            if (this.acquireLock(path)) return true;
+            if (!(await this.waitForRetry())) return false;
+        }
+        return false;
+    }
+
+    private scheduleOperation(operation: () => Promise<void>): void {
+        void this.waitForRetry().then(active => {
+            if (active) return operation();
+            return undefined;
+        }).catch(error => {
+            if (!this.disposed) console.error('[LocalLeaf] Delayed synchronization failed:', error);
+        });
     }
 
     private suppressRemoteRename(entityId: string, newName: string): void {
@@ -493,23 +605,164 @@ export class SyncEngine {
         return true;
     }
 
+    private documentUpdateFingerprint(update: DocumentUpdate): string {
+        return JSON.stringify([update.v, update.lastV, update.op || []]);
+    }
+
+    private suppressRemoteDocumentUpdate(update: DocumentUpdate): void {
+        const fingerprints = this.suppressedRemoteDocumentUpdates.get(update.doc) || new Set<string>();
+        fingerprints.add(this.documentUpdateFingerprint(update));
+        while (fingerprints.size > 100) {
+            const oldest = fingerprints.values().next().value as string | undefined;
+            if (oldest === undefined) break;
+            fingerprints.delete(oldest);
+        }
+        this.suppressedRemoteDocumentUpdates.set(update.doc, fingerprints);
+    }
+
+    private consumeSuppressedRemoteDocumentUpdate(update: DocumentUpdate): boolean {
+        const fingerprints = this.suppressedRemoteDocumentUpdates.get(update.doc);
+        if (!fingerprints?.delete(this.documentUpdateFingerprint(update))) return false;
+        if (fingerprints.size === 0) this.suppressedRemoteDocumentUpdates.delete(update.doc);
+        return true;
+    }
+
+    private rebaseTrackedPathMap<T>(map: Map<string, T>, oldPath: string, newPath: string): void {
+        const updates = [...map.entries()]
+            .filter(([path]) => path === oldPath || (oldPath.endsWith('/') && path.startsWith(oldPath)))
+            .map(([path, value]) => ({ oldPath: path, newPath: newPath + path.slice(oldPath.length), value }));
+        for (const update of updates) map.delete(update.oldPath);
+        for (const update of updates) map.set(update.newPath, update.value);
+    }
+
+    private rebaseFileTree(oldPath: string, newPath: string): void {
+        const updates = [...this.fileTree.values()]
+            .filter(entry => entry.path === oldPath || (oldPath.endsWith('/') && entry.path.startsWith(oldPath)))
+            .map(entry => ({ entry, oldPath: entry.path, newPath: newPath + entry.path.slice(oldPath.length) }));
+        for (const update of updates) this.fileTreeByPath.delete(update.oldPath);
+        for (const update of updates) {
+            update.entry.path = update.newPath;
+            this.fileTreeByPath.set(update.newPath, update.entry);
+        }
+        this.rebaseTrackedPathMap(this.baseContent, oldPath, newPath);
+        this.rebaseTrackedPathMap(this.fileCache, oldPath, newPath);
+    }
+
+    private removeTrackedSubtree(path: string): void {
+        const matches = (candidate: string) => candidate === path
+            || (path.endsWith('/') && candidate.startsWith(path));
+        for (const [id, entry] of [...this.fileTree]) {
+            if (!matches(entry.path)) continue;
+            this.fileTree.delete(id);
+            this.fileTreeByPath.delete(entry.path);
+            this.joinedDocs.delete(id);
+        }
+        for (const key of [...this.baseContent.keys()]) {
+            if (matches(key)) this.baseContent.delete(key);
+        }
+        for (const key of [...this.fileCache.keys()]) {
+            if (matches(key)) this.fileCache.delete(key);
+        }
+    }
+
+    private async handleRootDocumentUpdated(rootDocId: string): Promise<void> {
+        if (!this.project) return;
+        if (!rootDocId) {
+            this.project.rootDoc_id = undefined;
+            await this.settings.update({ mainTex: undefined, mainPdf: undefined });
+            const currentSettings = this.settings.getSettings();
+            if (currentSettings) this.ignoreParser.updateSettings(currentSettings);
+            return;
+        }
+        this.project.rootDoc_id = validateOpaqueId(rootDocId, 'root document ID');
+        await this.detectMainDocument();
+    }
+
+    private removeTrackedContent(path: string): void {
+        const matches = (candidate: string) => candidate === path
+            || (path.endsWith('/') && candidate.startsWith(path));
+        for (const key of [...this.baseContent.keys()]) {
+            if (matches(key)) this.baseContent.delete(key);
+        }
+        for (const key of [...this.fileCache.keys()]) {
+            if (matches(key)) this.fileCache.delete(key);
+        }
+    }
+
+    private async materializeRemoteEntry(entry: FileTreeEntry): Promise<'downloaded' | 'skipped'> {
+        if (!this.shouldSync(entry.path)) return 'skipped';
+        const localUri = this.settings.getFilePath(entry.path);
+        await this.assertNoSymbolicLinks(localUri);
+        this.throwIfDisposed();
+
+        if (entry.type === 'folder') {
+            await vscode.workspace.fs.createDirectory(localUri);
+            this.baseContent.set(entry.path, new Uint8Array(0));
+            return 'downloaded';
+        }
+
+        const projectSettings = this.settings.getSettings()!;
+        let content: Uint8Array;
+        if (entry.type === 'doc') {
+            const result = await this.api.getDocContent(projectSettings.projectId, entry.id);
+            ensureApiSuccess(result, `Download ${entry.path}`);
+            if (!result.lines) throw new Error(`Download ${entry.path}: Overleaf returned no content`);
+            content = new TextEncoder().encode(result.lines.join('\n'));
+        } else {
+            const result = await this.api.getFile(projectSettings.projectId, entry.id);
+            ensureApiSuccess(result, `Download ${entry.path}`);
+            if (!result.content) throw new Error(`Download ${entry.path}: Overleaf returned no content`);
+            content = result.content;
+        }
+
+        const resolution = await this.askNewRemoteFileResolution(entry.path, content);
+        this.throwIfDisposed();
+        if (resolution === 'skip') return 'skipped';
+
+        await vscode.workspace.fs.writeFile(localUri, content);
+        this.baseContent.set(entry.path, content);
+        this.fileCache.set(entry.path, hashContent(content));
+        if (entry.type === 'doc' && this.socket && !this.joinedDocs.has(entry.id)) {
+            try {
+                await this.socket.joinDoc(entry.id);
+                this.joinedDocs.add(entry.id);
+            } catch (error) {
+                debugLog(`Unable to watch new document ${entry.path}:`, error);
+            }
+        }
+        this.log(`Downloaded from Overleaf: ${entry.path}`);
+        return 'downloaded';
+    }
+
+    private async materializeRemoteSubtree(path: string): Promise<void> {
+        const entries = [...this.fileTree.values()]
+            .filter(entry => entry.path === path || (path.endsWith('/') && entry.path.startsWith(path)))
+            .sort((left, right) => {
+                if (left.type === 'folder' && right.type !== 'folder') return -1;
+                if (left.type !== 'folder' && right.type === 'folder') return 1;
+                return left.path.length - right.path.length;
+            });
+        for (const entry of entries) {
+            await this.materializeRemoteEntry(entry);
+        }
+    }
+
     // === Local change handlers ===
 
     /**
      * Handle local file change
      */
     private async handleLocalFileChange(uri: vscode.Uri): Promise<void> {
+        if (this.disposed) return;
         const relativePath = this.getRelativePath(uri);
         if (!this.shouldSync(relativePath)) return;
-        if (!this.acquireLock(relativePath)) {
-            setTimeout(() => void this.handleLocalFileChange(uri), DEBOUNCE_DELAY);
-            return;
-        }
+        if (!(await this.acquireLockWhenAvailable(relativePath))) return;
 
         try {
             // Read file content - may throw if file was deleted between watcher event and now
             let content: Uint8Array;
             try {
+                await this.assertNoSymbolicLinks(uri);
                 content = await vscode.workspace.fs.readFile(uri);
             } catch (readError) {
                 // File was deleted between watcher event and read - this is normal during rapid operations
@@ -520,7 +773,7 @@ export class SyncEngine {
                 throw readError;
             }
 
-            if (!this.shouldPropagate('push', relativePath, content)) return;
+            if (!this.shouldPropagate(relativePath, content)) return;
 
             const entry = this.fileTreeByPath.get(relativePath);
             if (!entry) {
@@ -584,7 +837,13 @@ export class SyncEngine {
                     op: ops,
                     v: version,
                 };
-                await this.socket.applyOtUpdate(docId, update);
+                this.suppressRemoteDocumentUpdate(update);
+                try {
+                    await this.socket.applyOtUpdate(docId, update);
+                } catch (error) {
+                    this.consumeSuppressedRemoteDocumentUpdate(update);
+                    throw error;
+                }
 
                 // Keep doc joined for watching
                 this.joinedDocs.add(docId);
@@ -601,23 +860,37 @@ export class SyncEngine {
     }
 
     /**
-     * Calculate OT operations for text diff
-     * Simple implementation - for production, use diff-match-patch
+     * Calculate a compact single-range OT update using the common prefix and suffix.
      */
     private calculateOps(oldText: string, newText: string): Array<{ p: number; i?: string; d?: string }> {
-        const ops: Array<{ p: number; i?: string; d?: string }> = [];
+        if (oldText === newText) return [];
 
-        // Simple diff: delete old, insert new
-        // TODO: Use proper diff algorithm for better performance
-        if (oldText !== newText) {
-            if (oldText.length > 0) {
-                ops.push({ p: 0, d: oldText });
-            }
-            if (newText.length > 0) {
-                ops.push({ p: 0, i: newText });
-            }
+        let prefixLength = 0;
+        const sharedLength = Math.min(oldText.length, newText.length);
+        while (
+            prefixLength < sharedLength
+            && oldText.charCodeAt(prefixLength) === newText.charCodeAt(prefixLength)
+        ) {
+            prefixLength++;
         }
 
+        let suffixLength = 0;
+        while (
+            suffixLength < oldText.length - prefixLength
+            && suffixLength < newText.length - prefixLength
+            && oldText.charCodeAt(oldText.length - suffixLength - 1)
+                === newText.charCodeAt(newText.length - suffixLength - 1)
+        ) {
+            suffixLength++;
+        }
+
+        const oldEnd = oldText.length - suffixLength;
+        const newEnd = newText.length - suffixLength;
+        const deleted = oldText.slice(prefixLength, oldEnd);
+        const inserted = newText.slice(prefixLength, newEnd);
+        const ops: Array<{ p: number; i?: string; d?: string }> = [];
+        if (deleted) ops.push({ p: prefixLength, d: deleted });
+        if (inserted) ops.push({ p: prefixLength, i: inserted });
         return ops;
     }
 
@@ -627,6 +900,16 @@ export class SyncEngine {
         ensureApiSuccess(result, 'Refresh project file tree');
 
         if (!result.projectData?.rootFolder) {
+            // Some self-hosted Overleaf versions expose the project tree only
+            // through Socket.IO, not in the project page metadata. In that
+            // case the live tree built during connect (and maintained by
+            // socket events) is still authoritative enough for operations
+            // such as cleaning ignored remote files. Do not discard it just
+            // because the optional HTTP refresh is unavailable.
+            if (this.fileTree.size > 0 && this.fileTreeByPath.size > 0) {
+                debugLog('HTTP project tree refresh unavailable; keeping the live project tree');
+                return;
+            }
             throw new Error('Refresh project file tree: Overleaf returned no folder tree');
         }
 
@@ -649,15 +932,24 @@ export class SyncEngine {
         if (!result.file?._id) {
             return undefined;
         }
+        const entityId = validateOpaqueId(result.file._id, 'uploaded entity ID');
+        const entityType = result.file._type || 'file';
+        const existing = this.fileTree.get(entityId);
+        if (existing) {
+            if (existing.path !== path || existing.type !== entityType) {
+                throw new Error(`Overleaf reused uploaded entity ID: ${entityId}`);
+            }
+            return existing;
+        }
 
         const entry: FileTreeEntry = {
-            id: result.file._id,
-            type: result.file._type || 'file',
+            id: entityId,
+            type: entityType,
             name: result.file.name || name,
             path,
             parentId,
         };
-        this.fileTree.set(entry.id, entry);
+        this.fileTree.set(entityId, entry);
         this.fileTreeByPath.set(path, entry);
         debugLog('Tracked uploaded file:', path, entry.id);
         return entry;
@@ -678,14 +970,19 @@ export class SyncEngine {
 
         let entry: FileTreeEntry | undefined;
         if (result.doc?._id) {
-            entry = {
-                id: result.doc._id,
+            const docId = validateOpaqueId(result.doc._id, 'document ID');
+            const existing = this.fileTree.get(docId);
+            if (existing && (existing.path !== relativePath || existing.type !== 'doc')) {
+                throw new Error(`Overleaf reused document ID: ${docId}`);
+            }
+            entry = existing || {
+                id: docId,
                 type: 'doc',
                 name: result.doc.name || name,
                 path: relativePath,
                 parentId,
             };
-            this.fileTree.set(entry.id, entry);
+            this.fileTree.set(docId, entry);
             this.fileTreeByPath.set(relativePath, entry);
         } else {
             await this.refreshProjectFileTree();
@@ -724,6 +1021,9 @@ export class SyncEngine {
         if (!preserveLocal) {
             this.baseContent.delete(entry.path);
             this.fileCache.delete(entry.path);
+        }
+        if (entry.id === this.project?.rootDoc_id) {
+            await this.handleRootDocumentUpdated('');
         }
     }
 
@@ -782,7 +1082,7 @@ export class SyncEngine {
 
             const originalEntry = this.fileTree.get(entry.id) || entry;
             await this.deleteRemoteEntry(originalEntry, true);
-            this.fileCache.set(entry.path, { hash: hashContent(content), timestamp: Date.now() });
+            this.fileCache.set(entry.path, hashContent(content));
         } catch (error) {
             if (renamedOriginal && !uploadedReplacement) {
                 try {
@@ -823,17 +1123,16 @@ export class SyncEngine {
      * Handle local file creation
      */
     private async handleLocalFileCreate(uri: vscode.Uri): Promise<void> {
+        if (this.disposed) return;
         const relativePath = this.getRelativePath(uri);
         if (!this.shouldSync(relativePath)) return;
-        if (!this.acquireLock(relativePath)) {
-            setTimeout(() => void this.handleLocalFileCreate(uri), DEBOUNCE_DELAY);
-            return;
-        }
+        if (!(await this.acquireLockWhenAvailable(relativePath))) return;
 
         try {
             // Stat the file - may throw if file was deleted between watcher event and now
             let stat: vscode.FileStat;
             try {
+                await this.assertNoSymbolicLinks(uri);
                 stat = await vscode.workspace.fs.stat(uri);
             } catch (statError) {
                 if (isFileNotFoundError(statError)) {
@@ -843,15 +1142,15 @@ export class SyncEngine {
                 throw statError;
             }
 
-            const trackedPath = stat.type === vscode.FileType.Directory
+            const trackedPath = (stat.type & vscode.FileType.Directory) !== 0
                 ? relativePath + '/'
                 : relativePath;
             if (this.fileTreeByPath.has(trackedPath)) {
                 // A create event can be the local echo of a remote write or an
                 // editor's atomic replacement of an existing file. Folders
                 // already exist remotely; files are re-evaluated as changes.
-                if (stat.type !== vscode.FileType.Directory) {
-                    setTimeout(() => void this.handleLocalFileChange(uri), DEBOUNCE_DELAY);
+                if ((stat.type & vscode.FileType.Directory) === 0) {
+                    this.scheduleOperation(() => this.handleLocalFileChange(uri));
                 }
                 return;
             }
@@ -864,21 +1163,26 @@ export class SyncEngine {
             const parentId = await this.ensureParentFoldersExist(relativePath);
             const name = relativePath.split('/').pop()!;
 
-            if (stat.type === vscode.FileType.Directory) {
+            if ((stat.type & vscode.FileType.Directory) !== 0) {
                 const folderPath = relativePath + '/';
                 const result = await this.api.addFolder(projectSettings.projectId, parentId, name);
                 ensureApiSuccess(result, `Create folder ${folderPath}`);
 
                 // Add folder to file tree immediately (don't wait for socket event)
                 if (result.type === 'success' && result.folder) {
-                    const folderEntry: FileTreeEntry = {
-                        id: result.folder._id,
+                    const folderId = validateOpaqueId(result.folder._id, 'folder ID');
+                    const existing = this.fileTree.get(folderId);
+                    if (existing && (existing.path !== folderPath || existing.type !== 'folder')) {
+                        throw new Error(`Overleaf reused folder ID: ${folderId}`);
+                    }
+                    const folderEntry: FileTreeEntry = existing || {
+                        id: folderId,
                         type: 'folder',
                         name: name,
                         path: folderPath,
                         parentId: parentId,
                     };
-                    this.fileTree.set(result.folder._id, folderEntry);
+                    this.fileTree.set(folderId, folderEntry);
                     this.fileTreeByPath.set(folderPath, folderEntry);
                     debugLog('Added folder to tree:', folderPath, result.folder._id);
                 }
@@ -926,7 +1230,7 @@ export class SyncEngine {
                 }
 
                 this.baseContent.set(relativePath, content);
-                this.fileCache.set(relativePath, { hash: hashContent(content), timestamp: Date.now() });
+                this.fileCache.set(relativePath, hashContent(content));
             }
 
             this.setStatus('idle');
@@ -949,14 +1253,13 @@ export class SyncEngine {
      * Handle local file deletion
      */
     private async handleLocalFileDelete(uri: vscode.Uri): Promise<void> {
+        if (this.disposed) return;
         const relativePath = this.getRelativePath(uri);
         if (!this.shouldSync(relativePath)) return;
-        if (!this.acquireLock(relativePath)) {
-            setTimeout(() => void this.handleLocalFileDelete(uri), DEBOUNCE_DELAY);
-            return;
-        }
+        if (!(await this.acquireLockWhenAvailable(relativePath))) return;
 
         try {
+            await this.assertNoSymbolicLinks(uri);
             // Try both file path and folder path (with trailing slash)
             let entry = this.fileTreeByPath.get(relativePath);
             let pathToUse = relativePath;
@@ -995,8 +1298,7 @@ export class SyncEngine {
             this.setStatus('pushing', `Deleting ${pathToUse}`, pathToUse);
 
             await this.deleteRemoteEntry(entry, true);
-            this.baseContent.delete(pathToUse);
-            this.fileCache.delete(pathToUse);
+            this.removeTrackedSubtree(pathToUse);
 
             this.log(`Deleted from Overleaf: ${pathToUse}`);
             this.setStatus('idle');
@@ -1015,35 +1317,40 @@ export class SyncEngine {
      * Handle remote file created
      */
     private async handleRemoteFileCreated(parentId: string, type: 'doc' | 'file' | 'folder', entity: FileEntity): Promise<void> {
-        const parent = this.fileTree.get(parentId);
-        const parentPath = parent?.path || '/';
-        const path = type === 'folder' ? parentPath + entity.name + '/' : parentPath + entity.name;
+        const safeParentId = validateOpaqueId(parentId, 'parent folder ID');
+        const entityId = validateOpaqueId(entity?._id, 'entity ID');
+        const parent = this.fileTree.get(safeParentId);
+        if (!parent || parent.type !== 'folder') {
+            throw new Error(`Overleaf created an entity under an unknown folder: ${safeParentId}`);
+        }
+        const path = joinProjectPath(parent.path, entity.name, type === 'folder');
 
         // Record the remote identity before taking the path lock. Local
         // uploads hold this lock while Overleaf emits the create event.
         const entry: FileTreeEntry = {
-            id: entity._id,
+            id: entityId,
             type,
             name: entity.name,
             path,
-            parentId,
+            parentId: safeParentId,
         };
-        this.fileTree.set(entity._id, entry);
-        this.fileTreeByPath.set(path, entry);
+        const existingById = this.fileTree.get(entityId);
+        const existingByPath = this.fileTreeByPath.get(path);
+        if (existingById && existingById.path !== path) {
+            throw new Error(`Overleaf reused entity ID ${entityId} for a different path.`);
+        }
+        if (existingByPath && existingByPath.id !== entityId) {
+            throw new Error(`Overleaf created a duplicate entity path: ${path}`);
+        }
+        const trackedEntry = existingById || entry;
+        this.fileTree.set(entityId, trackedEntry);
+        this.fileTreeByPath.set(path, trackedEntry);
 
         if (!this.shouldSync(path)) return;
-        if (!this.acquireLock(path)) {
-            setTimeout(
-                () => void this.handleRemoteFileCreated(parentId, type, entity),
-                DEBOUNCE_DELAY
-            );
-            return;
-        }
+        if (!(await this.acquireLockWhenAvailable(path))) return;
 
         try {
             this.setStatus('pulling', `Downloading ${path}`, path);
-
-            const localUri = this.settings.getFilePath(path);
 
             // Check if this is an echo of our own creation (file already in baseContent)
             const alreadySynced = this.baseContent.has(path);
@@ -1053,59 +1360,17 @@ export class SyncEngine {
                 return;
             }
 
-            if (type === 'folder') {
-                await vscode.workspace.fs.createDirectory(localUri);
-                // Track folders in baseContent with empty content
-                this.baseContent.set(path, new Uint8Array(0));
-            } else {
-                // Download content - use correct API based on type
-                const projectSettings = this.settings.getSettings()!;
-                let content: Uint8Array | undefined;
-
-                if (type === 'doc') {
-                    // For docs, use getDocContent
-                    const result = await this.api.getDocContent(projectSettings.projectId, entity._id);
-                    if (result.type === 'success' && result.lines) {
-                        content = new TextEncoder().encode(result.lines.join('\n'));
-                    }
-                } else {
-                    // For binary files, use getFile
-                    const result = await this.api.getFile(projectSettings.projectId, entity._id);
-                    if (result.type === 'success' && result.content) {
-                        content = result.content;
-                    }
-                }
-
-                if (content) {
-                    // Prompt user for new remote files
-                    const resolution = await this.askNewRemoteFileResolution(path, content);
-                    if (resolution === 'skip') {
-                        debugLog(`Skipped new remote file (user choice): ${path}`);
-                        this.log(`Skipped new file from Overleaf: ${path}`);
-                        this.setStatus('idle');
-                        return;
-                    }
-
-                    await vscode.workspace.fs.writeFile(localUri, content);
-                    this.baseContent.set(path, content);
-                    this.fileCache.set(path, { hash: hashContent(content), timestamp: Date.now() });
-                    this.log(`Downloaded new file from Overleaf: ${path}`);
-                }
-
-                // Join new docs to receive OT updates
-                if (type === 'doc' && this.socket && !this.joinedDocs.has(entity._id)) {
-                    try {
-                        await this.socket.joinDoc(entity._id);
-                        this.joinedDocs.add(entity._id);
-                    } catch {
-                        // Ignore join errors
-                    }
-                }
+            const result = await this.materializeRemoteEntry(trackedEntry);
+            if (result === 'skipped') {
+                debugLog(`Skipped new remote file (user choice): ${path}`);
+                this.log(`Skipped new file from Overleaf: ${path}`);
             }
 
             this.setStatus('idle');
         } catch (error) {
             console.error(`[LocalLeaf] Failed to sync remote create ${path}:`, error);
+            const authErr = isAuthError(error);
+            this.setStatus('error', authErr ? 'Session expired' : `Failed to download ${path}: ${error}`, path, authErr);
         } finally {
             this.releaseLock(path);
         }
@@ -1115,48 +1380,64 @@ export class SyncEngine {
      * Handle remote file renamed
      */
     private async handleRemoteFileRenamed(entityId: string, newName: string): Promise<void> {
+        entityId = validateOpaqueId(entityId, 'entity ID');
         if (this.consumeSuppressedRemoteRename(entityId, newName)) {
             return;
         }
 
         const entry = this.fileTree.get(entityId);
         if (!entry) return;
+        if (entry.path === '/') {
+            throw new Error('Refusing to rename the Overleaf project root.');
+        }
 
         const oldPath = entry.path;
-        const parentPath = oldPath.substring(0, oldPath.lastIndexOf('/') + 1);
-        const newPath = entry.type === 'folder' ? parentPath + newName + '/' : parentPath + newName;
+        const pathWithoutTrailingSlash = entry.type === 'folder' ? oldPath.slice(0, -1) : oldPath;
+        const parentPath = pathWithoutTrailingSlash.substring(
+            0,
+            pathWithoutTrailingSlash.lastIndexOf('/') + 1,
+        );
+        const newPath = joinProjectPath(parentPath, newName, entry.type === 'folder');
+        const syncedBefore = this.shouldSync(oldPath);
+        const syncedAfter = this.shouldSync(newPath);
 
-        if (!this.acquireLock(oldPath)) return;
+        if (!(await this.acquireLockWhenAvailable(oldPath))) return;
 
         try {
             this.setStatus('pulling', `Renaming ${oldPath} to ${newPath}`, oldPath);
 
-            // Update tree
-            entry.name = newName;
-            entry.path = newPath;
-            this.fileTreeByPath.delete(oldPath);
-            this.fileTreeByPath.set(newPath, entry);
-
-            // Rename local file
             const oldUri = this.settings.getFilePath(oldPath);
             const newUri = this.settings.getFilePath(newPath);
-            await vscode.workspace.fs.rename(oldUri, newUri);
+            await this.assertNoSymbolicLinks(oldUri);
+            await this.assertNoSymbolicLinks(newUri);
+            this.throwIfDisposed();
+            if (syncedBefore) {
+                try {
+                    if (syncedAfter) {
+                        await vscode.workspace.fs.rename(oldUri, newUri);
+                    } else {
+                        await vscode.workspace.fs.delete(oldUri, { recursive: true });
+                        this.removeTrackedContent(oldPath);
+                    }
+                } catch (error) {
+                    if (!isFileNotFoundError(error)) throw error;
+                }
+            }
 
-            // Update caches
-            const content = this.baseContent.get(oldPath);
-            if (content) {
-                this.baseContent.delete(oldPath);
-                this.baseContent.set(newPath, content);
+            // Rebase the folder and every descendant only after the local
+            // operation succeeds, so the in-memory tree cannot get ahead of disk.
+            entry.name = validateProjectEntityName(newName);
+            this.rebaseFileTree(oldPath, newPath);
+            if (!syncedBefore && syncedAfter) {
+                await this.materializeRemoteSubtree(newPath);
             }
-            const cache = this.fileCache.get(oldPath);
-            if (cache) {
-                this.fileCache.delete(oldPath);
-                this.fileCache.set(newPath, cache);
-            }
+            if (entry.id === this.project?.rootDoc_id) await this.detectMainDocument();
 
             this.setStatus('idle');
         } catch (error) {
             console.error(`[LocalLeaf] Failed to sync remote rename:`, error);
+            const authErr = isAuthError(error);
+            this.setStatus('error', authErr ? 'Session expired' : `Failed to rename ${oldPath}: ${error}`, oldPath, authErr);
         } finally {
             this.releaseLock(oldPath);
         }
@@ -1166,12 +1447,17 @@ export class SyncEngine {
      * Handle remote file removed
      */
     private async handleRemoteFileRemoved(entityId: string): Promise<void> {
+        entityId = validateOpaqueId(entityId, 'entity ID');
         if (this.suppressedRemoteDeletes.delete(entityId)) {
             const suppressedEntry = this.fileTree.get(entityId);
             if (suppressedEntry) {
-                this.fileTree.delete(entityId);
-                if (this.fileTreeByPath.get(suppressedEntry.path)?.id === entityId) {
-                    this.fileTreeByPath.delete(suppressedEntry.path);
+                if (suppressedEntry.type === 'folder') {
+                    this.removeTrackedSubtree(suppressedEntry.path);
+                } else {
+                    this.fileTree.delete(entityId);
+                    if (this.fileTreeByPath.get(suppressedEntry.path)?.id === entityId) {
+                        this.fileTreeByPath.delete(suppressedEntry.path);
+                    }
                 }
             }
             return;
@@ -1179,37 +1465,55 @@ export class SyncEngine {
 
         const entry = this.fileTree.get(entityId);
         if (!entry) return;
+        if (entry.path === '/') {
+            throw new Error('Refusing to delete the Overleaf project root.');
+        }
 
-        if (!this.shouldSync(entry.path)) return;
-        if (!this.acquireLock(entry.path)) return;
+        if (!this.shouldSync(entry.path)) {
+            this.removeTrackedSubtree(entry.path);
+            return;
+        }
+        if (!(await this.acquireLockWhenAvailable(entry.path))) return;
 
         try {
             this.setStatus('pulling', `Deleting ${entry.path}`, entry.path);
 
-            // Leave doc if joined
-            if (entry.type === 'doc' && this.joinedDocs.has(entityId)) {
-                try {
-                    await this.socket?.leaveDoc(entityId);
-                } catch {
-                    // Ignore leave errors
-                }
-                this.joinedDocs.delete(entityId);
+            const removedEntries = [...this.fileTree.values()].filter(candidate =>
+                candidate.path === entry.path
+                || (entry.path.endsWith('/') && candidate.path.startsWith(entry.path))
+            );
+
+            // Delete local content first. If this fails, keep the remote tree
+            // and joined-document state intact so a later pull can retry.
+            const localUri = this.settings.getFilePath(entry.path);
+            await this.assertNoSymbolicLinks(localUri);
+            this.throwIfDisposed();
+            try {
+                await vscode.workspace.fs.delete(localUri, { recursive: true });
+            } catch (error) {
+                if (!isFileNotFoundError(error)) throw error;
             }
 
-            // Remove from tree
-            this.fileTree.delete(entityId);
-            this.fileTreeByPath.delete(entry.path);
+            for (const removedEntry of removedEntries) {
+                if (removedEntry.type === 'doc' && this.joinedDocs.has(removedEntry.id)) {
+                    try {
+                        await this.socket?.leaveDoc(removedEntry.id);
+                    } catch {
+                        // Ignore leave errors
+                    }
+                }
+            }
 
-            // Delete local file
-            const localUri = this.settings.getFilePath(entry.path);
-            await vscode.workspace.fs.delete(localUri, { recursive: true });
-
-            this.baseContent.delete(entry.path);
-            this.fileCache.delete(entry.path);
+            this.removeTrackedSubtree(entry.path);
+            if (entry.id === this.project?.rootDoc_id) {
+                await this.handleRootDocumentUpdated('');
+            }
 
             this.setStatus('idle');
         } catch (error) {
             console.error(`[LocalLeaf] Failed to sync remote delete:`, error);
+            const authErr = isAuthError(error);
+            this.setStatus('error', authErr ? 'Session expired' : `Failed to delete ${entry.path}: ${error}`, entry.path, authErr);
         } finally {
             this.releaseLock(entry.path);
         }
@@ -1219,34 +1523,55 @@ export class SyncEngine {
      * Handle remote file moved
      */
     private async handleRemoteFileMoved(entityId: string, newParentId: string): Promise<void> {
+        entityId = validateOpaqueId(entityId, 'entity ID');
+        newParentId = validateOpaqueId(newParentId, 'parent folder ID');
         const entry = this.fileTree.get(entityId);
         const newParent = this.fileTree.get(newParentId);
-        if (!entry || !newParent) return;
+        if (!entry || !newParent || newParent.type !== 'folder') return;
+        if (entry.path === '/') {
+            throw new Error('Refusing to move the Overleaf project root.');
+        }
 
         const oldPath = entry.path;
-        const newPath = entry.type === 'folder'
-            ? newParent.path + entry.name + '/'
-            : newParent.path + entry.name;
+        const newPath = joinProjectPath(newParent.path, entry.name, entry.type === 'folder');
+        const syncedBefore = this.shouldSync(oldPath);
+        const syncedAfter = this.shouldSync(newPath);
 
-        if (!this.acquireLock(oldPath)) return;
+        if (!(await this.acquireLockWhenAvailable(oldPath))) return;
 
         try {
             this.setStatus('pulling', `Moving ${oldPath} to ${newPath}`, oldPath);
 
-            // Update tree
-            entry.path = newPath;
-            entry.parentId = newParentId;
-            this.fileTreeByPath.delete(oldPath);
-            this.fileTreeByPath.set(newPath, entry);
-
-            // Move local file
             const oldUri = this.settings.getFilePath(oldPath);
             const newUri = this.settings.getFilePath(newPath);
-            await vscode.workspace.fs.rename(oldUri, newUri);
+            await this.assertNoSymbolicLinks(oldUri);
+            await this.assertNoSymbolicLinks(newUri);
+            this.throwIfDisposed();
+            if (syncedBefore) {
+                try {
+                    if (syncedAfter) {
+                        await vscode.workspace.fs.rename(oldUri, newUri);
+                    } else {
+                        await vscode.workspace.fs.delete(oldUri, { recursive: true });
+                        this.removeTrackedContent(oldPath);
+                    }
+                } catch (error) {
+                    if (!isFileNotFoundError(error)) throw error;
+                }
+            }
+
+            this.rebaseFileTree(oldPath, newPath);
+            entry.parentId = newParentId;
+            if (!syncedBefore && syncedAfter) {
+                await this.materializeRemoteSubtree(newPath);
+            }
+            if (entry.id === this.project?.rootDoc_id) await this.detectMainDocument();
 
             this.setStatus('idle');
         } catch (error) {
             console.error(`[LocalLeaf] Failed to sync remote move:`, error);
+            const authErr = isAuthError(error);
+            this.setStatus('error', authErr ? 'Session expired' : `Failed to move ${oldPath}: ${error}`, oldPath, authErr);
         } finally {
             this.releaseLock(oldPath);
         }
@@ -1256,56 +1581,126 @@ export class SyncEngine {
      * Handle remote file content changed (OT update)
      */
     private async handleRemoteFileChanged(update: DocumentUpdate): Promise<void> {
+        validateOpaqueId(update?.doc, 'document ID');
+        if (update.op !== undefined && !Array.isArray(update.op)) {
+            throw new Error('Overleaf returned an invalid document update.');
+        }
+        const isOwnUpdate = update.meta?.source === this.socket?.publicId;
+        const wasSuppressed = this.consumeSuppressedRemoteDocumentUpdate(update);
+        if (isOwnUpdate) {
+            return;
+        }
+        if (wasSuppressed) return;
         const entry = this.fileTree.get(update.doc);
         if (!entry || entry.type !== 'doc') {
             return;
         }
 
         if (!this.shouldSync(entry.path)) return;
-        if (!this.acquireLock(entry.path)) return;
+        if (!(await this.acquireLockWhenAvailable(entry.path))) return;
 
         try {
             // Get current local content
             const localUri = this.settings.getFilePath(entry.path);
-            let localContent: string;
+            await this.assertNoSymbolicLinks(localUri);
             let localBytes: Uint8Array | undefined;
             try {
                 localBytes = await vscode.workspace.fs.readFile(localUri);
-                localContent = new TextDecoder().decode(localBytes);
             } catch {
-                localContent = '';
                 localBytes = undefined;
             }
 
-            // Apply OT operations
-            let newContent = localContent;
-            if (update.op) {
-                for (const op of update.op) {
-                    if (op.d !== undefined) {
-                        // Delete operation
-                        newContent = newContent.slice(0, op.p) + newContent.slice(op.p + op.d.length);
+            const baseBytes = this.baseContent.get(entry.path);
+            let contentBytes: Uint8Array | undefined;
+
+            // Apply operations to the last known server state, never directly to
+            // an unsynchronized local edit. If the state is unavailable or the
+            // operation does not match it, recover from the authoritative copy.
+            if (baseBytes) {
+                try {
+                    let newContent = new TextDecoder().decode(baseBytes);
+                    if (newContent.length > MAX_DOCUMENT_CHARACTERS) {
+                        throw new Error('Overleaf document exceeds the synchronization size limit.');
                     }
-                    if (op.i !== undefined) {
-                        // Insert operation
-                        newContent = newContent.slice(0, op.p) + op.i + newContent.slice(op.p);
+                    for (const op of update.op || []) {
+                        if (!Number.isSafeInteger(op.p) || op.p < 0 || op.p > newContent.length) {
+                            throw new Error(`Invalid Overleaf document operation position: ${op.p}`);
+                        }
+                        if (op.d !== undefined) {
+                            if (
+                                typeof op.d !== 'string'
+                                || op.p + op.d.length > newContent.length
+                                || newContent.slice(op.p, op.p + op.d.length) !== op.d
+                            ) {
+                                throw new Error('Overleaf document delete operation did not match the known content.');
+                            }
+                            newContent = newContent.slice(0, op.p) + newContent.slice(op.p + op.d.length);
+                        }
+                        if (op.i !== undefined) {
+                            if (typeof op.i !== 'string' || newContent.length + op.i.length > MAX_DOCUMENT_CHARACTERS) {
+                                throw new Error('Invalid or oversized Overleaf document insert operation.');
+                            }
+                            newContent = newContent.slice(0, op.p) + op.i + newContent.slice(op.p);
+                        }
                     }
+                    contentBytes = new TextEncoder().encode(newContent);
+                } catch (operationError) {
+                    debugLog(`Recovering ${entry.path} after an unusable OT update:`, operationError);
+                }
+            }
+
+            if (!contentBytes) {
+                const projectSettings = this.settings.getSettings()!;
+                const result = await this.api.getDocContent(projectSettings.projectId, entry.id);
+                ensureApiSuccess(result, `Refresh ${entry.path}`);
+                if (!result.lines) throw new Error(`Refresh ${entry.path}: Overleaf returned no content`);
+                const recovered = result.lines.join('\n');
+                if (recovered.length > MAX_DOCUMENT_CHARACTERS) {
+                    throw new Error(`Refresh ${entry.path}: document exceeds the synchronization size limit`);
+                }
+                contentBytes = new TextEncoder().encode(recovered);
+            }
+
+            const hasUnsynchronizedLocalChanges = localBytes !== undefined
+                && baseBytes !== undefined
+                && !contentEquals(localBytes, baseBytes);
+            if (hasUnsynchronizedLocalChanges) {
+                const resolution = await this.askConflictResolution(entry.path, localUri, contentBytes);
+                this.throwIfDisposed();
+                if (resolution === 'skip') {
+                    this.baseContent.set(entry.path, contentBytes);
+                    this.fileCache.set(entry.path, hashContent(localBytes));
+                    this.setStatus('idle', `Skipped conflicting remote update for ${entry.path}`, entry.path);
+                    return;
+                }
+                if (resolution === 'useLocal') {
+                    if (!this.socket) {
+                        throw new Error(`Cannot update ${entry.path}: real-time connection is unavailable`);
+                    }
+                    await this.pushDocumentChanges(entry.id, entry.path, localBytes!);
+                    this.baseContent.set(entry.path, localBytes!);
+                    this.fileCache.set(entry.path, hashContent(localBytes));
+                    this.setStatus('idle');
+                    return;
                 }
             }
 
             // Only write if content actually changed (prevents file flashing)
-            const contentBytes = new TextEncoder().encode(newContent);
             if (!contentEquals(localBytes, contentBytes)) {
                 this.setStatus('pulling', `Updating ${entry.path}`, entry.path);
+                this.throwIfDisposed();
                 await vscode.workspace.fs.writeFile(localUri, contentBytes);
                 this.log(`Remote update: ${entry.path}`);
             }
 
             this.baseContent.set(entry.path, contentBytes);
-            this.fileCache.set(entry.path, { hash: hashContent(contentBytes), timestamp: Date.now() });
+            this.fileCache.set(entry.path, hashContent(contentBytes));
 
             this.setStatus('idle');
         } catch (error) {
             console.error(`[LocalLeaf] Failed to apply OT update:`, error);
+            const authErr = isAuthError(error);
+            this.setStatus('error', authErr ? 'Session expired' : `Failed to update ${entry.path}: ${error}`, entry.path, authErr);
         } finally {
             this.releaseLock(entry.path);
         }
@@ -1333,22 +1728,6 @@ export class SyncEngine {
         if (joinedCount > 0) {
             this.log(`Watching ${joinedCount} documents for remote changes`);
         }
-    }
-
-    /**
-     * Leave all joined documents
-     */
-    private async leaveAllDocs(): Promise<void> {
-        if (!this.socket) return;
-
-        for (const docId of this.joinedDocs) {
-            try {
-                await this.socket.leaveDoc(docId);
-            } catch {
-                // Ignore leave errors
-            }
-        }
-        this.joinedDocs.clear();
     }
 
     // === Public methods ===
@@ -1393,29 +1772,28 @@ export class SyncEngine {
      * Show diff between local and remote file
      */
     private async showDiff(filePath: string, localUri: vscode.Uri, remoteContent: Uint8Array): Promise<void> {
-        // Create a temporary URI for the remote content
-        const remoteUri = vscode.Uri.parse(`localleaf-remote:${filePath}`);
+        const remoteUri = vscode.Uri.from({ scheme: 'localleaf-remote', path: filePath });
+        if (!this.remoteDiffChangeEmitter) {
+            const emitter = new vscode.EventEmitter<vscode.Uri>();
+            const provider: vscode.TextDocumentContentProvider = {
+                onDidChange: emitter.event,
+                provideTextDocumentContent: uri => this.remoteDiffContents.get(uri.toString()) || '',
+            };
+            this.remoteDiffChangeEmitter = emitter;
+            this.disposables.push(
+                emitter,
+                vscode.workspace.registerTextDocumentContentProvider('localleaf-remote', provider),
+            );
+        }
 
-        // Register a content provider for the remote file
-        const provider = new (class implements vscode.TextDocumentContentProvider {
-            provideTextDocumentContent(): string {
-                return new TextDecoder().decode(remoteContent);
-            }
-        })();
+        this.remoteDiffContents.set(remoteUri.toString(), new TextDecoder().decode(remoteContent));
+        this.remoteDiffChangeEmitter.fire(remoteUri);
 
-        const disposable = vscode.workspace.registerTextDocumentContentProvider('localleaf-remote', provider);
-
-        try {
-            // Open diff editor
-            await vscode.commands.executeCommand('vscode.diff',
+        await vscode.commands.executeCommand('vscode.diff',
                 localUri,
                 remoteUri,
                 `${filePath} (Local ↔ Remote)`
-            );
-        } finally {
-            // Keep provider registered while diff is open
-            setTimeout(() => disposable.dispose(), 60000); // Dispose after 1 minute
-        }
+        );
     }
 
     /**
@@ -1536,9 +1914,12 @@ export class SyncEngine {
         );
 
         if (choice === 'Delete Locally') {
+            this.throwIfDisposed();
             for (const path of orphanedPaths) {
+                if (this.disposed) break;
                 try {
                     const localUri = this.settings.getFilePath(path);
+                    await this.assertNoSymbolicLinks(localUri);
                     await vscode.workspace.fs.delete(localUri, { recursive: false });
                     this.baseContent.delete(path);
                     this.fileCache.delete(path);
@@ -1548,7 +1929,9 @@ export class SyncEngine {
                 }
             }
         } else if (choice === 'Re-upload') {
+            this.throwIfDisposed();
             for (const path of orphanedPaths) {
+                if (this.disposed) break;
                 try {
                     await this.uploadLocalFile(path);
                     this.log(`Re-uploaded to Overleaf: ${path}`);
@@ -1584,7 +1967,9 @@ export class SyncEngine {
         );
 
         if (choice === 'Upload All') {
+            this.throwIfDisposed();
             for (const path of localOnlyPaths) {
+                if (this.disposed) break;
                 try {
                     await this.uploadLocalFile(path);
                     this.log(`Uploaded new file: ${path}`);
@@ -1641,6 +2026,7 @@ export class SyncEngine {
                 // Folder doesn't exist, create it
                 debugLog('Creating missing parent folder:', folderPath);
                 const result = await this.api.addFolder(projectSettings.projectId, currentParentId, segment);
+                this.throwIfDisposed();
 
                 if (result.type !== 'success' || !result.folder) {
                     throw new Error(`Failed to create folder ${folderPath}: ${result.message}`);
@@ -1648,19 +2034,24 @@ export class SyncEngine {
 
                 // Add to file tree
                 const folderEntry: FileTreeEntry = {
-                    id: result.folder._id,
+                    id: validateOpaqueId(result.folder._id, 'folder ID'),
                     type: 'folder',
                     name: segment,
                     path: folderPath,
                     parentId: currentParentId,
                 };
-                this.fileTree.set(result.folder._id, folderEntry);
-                this.fileTreeByPath.set(folderPath, folderEntry);
+                const existing = this.fileTree.get(folderEntry.id);
+                if (existing && (existing.path !== folderPath || existing.type !== 'folder')) {
+                    throw new Error(`Overleaf reused folder ID: ${folderEntry.id}`);
+                }
+                const trackedFolder = existing || folderEntry;
+                this.fileTree.set(trackedFolder.id, trackedFolder);
+                this.fileTreeByPath.set(folderPath, trackedFolder);
                 this.baseContent.set(folderPath, new Uint8Array(0));
 
                 this.log(`Created folder on Overleaf: ${folderPath}`);
 
-                currentParentId = result.folder._id;
+                currentParentId = trackedFolder.id;
                 currentPath = folderPath;
             }
         }
@@ -1674,7 +2065,9 @@ export class SyncEngine {
     private async uploadLocalFile(relativePath: string): Promise<void> {
         const projectSettings = this.settings.getSettings()!;
         const localUri = this.settings.getFilePath(relativePath);
+        await this.assertNoSymbolicLinks(localUri);
         const content = await vscode.workspace.fs.readFile(localUri);
+        this.throwIfDisposed();
 
         // Ensure all parent folders exist (creates them if needed)
         const parentId = await this.ensureParentFoldersExist(relativePath);
@@ -1700,6 +2093,7 @@ export class SyncEngine {
                 name,
                 content
             );
+            this.throwIfDisposed();
             ensureApiSuccess(result, `Upload ${relativePath}`);
             if (!this.trackUploadedEntity(result, parentId, name, relativePath)) {
                 await this.refreshProjectFileTree();
@@ -1707,7 +2101,7 @@ export class SyncEngine {
         }
 
         this.baseContent.set(relativePath, content);
-        this.fileCache.set(relativePath, { hash: hashContent(content), timestamp: Date.now() });
+        this.fileCache.set(relativePath, hashContent(content));
     }
 
     /**
@@ -1768,6 +2162,7 @@ export class SyncEngine {
      * Perform full sync (pull all files)
      */
     async pullAll(): Promise<void> {
+        this.throwIfDisposed();
         if (!this.project) {
             throw new Error('Not connected');
         }
@@ -1789,17 +2184,23 @@ export class SyncEngine {
 
         try {
             const downloadFile = async (entry: FileTreeEntry) => {
+                this.throwIfDisposed();
                 debugLog('pullAll: Processing', entry.path, entry.type);
 
                 if (entry.type === 'folder') {
+                    if (entry.path === '/') {
+                        this.baseContent.set('/', new Uint8Array(0));
+                        return;
+                    }
                     const localUri = this.settings.getFilePath(entry.path);
+                    await this.assertNoSymbolicLinks(localUri);
                     await vscode.workspace.fs.createDirectory(localUri);
                     // Track folders in baseContent with empty content
                     this.baseContent.set(entry.path, new Uint8Array(0));
                     return;
                 }
 
-                if (this.ignoreParser.shouldIgnore(entry.path)) {
+                if (!this.shouldSync(entry.path)) {
                     debugLog('pullAll: Ignored', entry.path);
                     return;
                 }
@@ -1847,6 +2248,7 @@ export class SyncEngine {
                 }
 
                 const localUri = this.settings.getFilePath(entry.path);
+                await this.assertNoSymbolicLinks(localUri);
                 const exists = await this.localFileExists(localUri);
                 const wasSynced = this.baseContent.has(entry.path);
 
@@ -1856,6 +2258,7 @@ export class SyncEngine {
                     if (hasConflict) {
                         conflictCount++;
                         const resolution = await this.askConflictResolution(entry.path, localUri, remoteContent);
+                        this.throwIfDisposed();
 
                         if (resolution === 'skip') {
                             debugLog('pullAll: Skipped (user choice)', entry.path);
@@ -1879,7 +2282,7 @@ export class SyncEngine {
                             }
 
                             this.baseContent.set(entry.path, localContent);
-                            this.fileCache.set(entry.path, { hash: hashContent(localContent), timestamp: Date.now() });
+                            this.fileCache.set(entry.path, hashContent(localContent));
                             return;
                         }
                         // resolution === 'useRemote' - continue to download
@@ -1888,6 +2291,7 @@ export class SyncEngine {
                     // New file on Overleaf that doesn't exist locally - prompt user
                     conflictCount++;
                     const resolution = await this.askNewRemoteFileResolution(entry.path, remoteContent);
+                    this.throwIfDisposed();
 
                     if (resolution === 'skip') {
                         debugLog('pullAll: Skipped new remote file (user choice)', entry.path);
@@ -1911,14 +2315,15 @@ export class SyncEngine {
                 if (contentEquals(localContent, remoteContent)) {
                     // Content is the same, just update cache
                     this.baseContent.set(entry.path, remoteContent);
-                    this.fileCache.set(entry.path, { hash: hashContent(remoteContent), timestamp: Date.now() });
+                    this.fileCache.set(entry.path, hashContent(remoteContent));
                     return;
                 }
 
                 this.setStatus('pulling', `Downloading ${entry.path}`, entry.path);
+                this.throwIfDisposed();
                 await vscode.workspace.fs.writeFile(localUri, remoteContent);
                 this.baseContent.set(entry.path, remoteContent);
-                this.fileCache.set(entry.path, { hash: hashContent(remoteContent), timestamp: Date.now() });
+                this.fileCache.set(entry.path, hashContent(remoteContent));
                 downloadedCount++;
             };
 
@@ -1936,7 +2341,7 @@ export class SyncEngine {
                 // Skip folders
                 if (syncedPath.endsWith('/')) continue;
                 // Skip ignored files
-                if (this.ignoreParser.shouldIgnore(syncedPath)) continue;
+                if (!this.shouldSync(syncedPath)) continue;
                 // Check if local file actually exists
                 const localUri = this.settings.getFilePath(syncedPath);
                 if (await this.localFileExists(localUri)) {
@@ -1950,19 +2355,27 @@ export class SyncEngine {
             // Detect local-only files (exist locally but not on Overleaf or in baseContent)
             const localOnlyPaths: string[] = [];
             const workspaceFolder = this.settings.getWorkspaceFolder();
+            await this.assertNoSymbolicLinks(workspaceFolder);
             const scanLocalFiles = async (dirUri: vscode.Uri, basePath: string = '/'): Promise<void> => {
                 try {
                     const entries = await vscode.workspace.fs.readDirectory(dirUri);
                     for (const [name, type] of entries) {
                         const relativePath = basePath + name;
-                        const fullPath = type === vscode.FileType.Directory
+                        const fullPath = (type & vscode.FileType.Directory) !== 0
                             ? relativePath + '/'
                             : relativePath;
 
                         // Skip ignored files
-                        if (this.ignoreParser.shouldIgnore(fullPath)) continue;
+                        if (!this.shouldSync(fullPath)) continue;
 
-                        if (type === vscode.FileType.Directory) {
+                        // Never traverse or upload a symbolic link. It may point
+                        // outside the workspace even though its visible path is inside.
+                        if ((type & vscode.FileType.SymbolicLink) !== 0) {
+                            this.log(`Skipped symbolic link: ${fullPath}`);
+                            continue;
+                        }
+
+                        if ((type & vscode.FileType.Directory) !== 0) {
                             await scanLocalFiles(vscode.Uri.joinPath(dirUri, name), fullPath);
                         } else {
                             // Check if this file is known to Overleaf or baseContent
@@ -2016,11 +2429,31 @@ export class SyncEngine {
      * Disconnect and cleanup
      */
     disconnect(): void {
+        if (this.disposed) return;
+        this.disposed = true;
+        for (const [timer, resolve] of this.pendingWaits) {
+            clearTimeout(timer);
+            resolve(false);
+        }
+        this.pendingWaits.clear();
         this.socket?.disconnect();
         this.socket = undefined;
+        this.api.dispose();
         this.disposables.forEach(d => d.dispose());
         this.disposables = [];
-        this.setStatus('disconnected');
+        this.syncLock.clear();
+        this.suppressedRemoteDocumentUpdates.clear();
+        this.suppressedRemoteDeletes.clear();
+        this.suppressedRemoteRenames.clear();
+        this.remoteDiffContents.clear();
+        this.fileTree.clear();
+        this.fileTreeByPath.clear();
+        this.fileCache.clear();
+        this.baseContent.clear();
+        this.joinedDocs.clear();
+        this._status = 'disconnected';
+        this._onStatusChange.fire({ status: 'disconnected' });
+        this._onStatusChange.dispose();
     }
 
     /**

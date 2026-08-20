@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { CREDENTIAL_KEY_PREFIX, DEFAULT_SERVER } from '../consts';
+import { validateServerUrl } from './serverUrl';
 
 /**
  * Identity contains authentication tokens for Overleaf
@@ -51,17 +52,60 @@ export class CredentialManager {
      * Get the storage key for a server URL
      */
     private getKey(serverUrl: string): string {
-        // Normalize server URL
-        const normalized = serverUrl.replace(/\/+$/, '').toLowerCase();
+        const normalized = validateServerUrl(serverUrl).url;
         return `${CREDENTIAL_KEY_PREFIX}${normalized}`;
+    }
+
+    private getLegacyKey(serverUrl: string): string {
+        return `${CREDENTIAL_KEY_PREFIX}${validateServerUrl(serverUrl).url.toLowerCase()}`;
+    }
+
+    private validateCredential(value: unknown, expectedServerUrl?: string): ServerCredential | undefined {
+        if (!value || typeof value !== 'object') return undefined;
+        const credential = value as Partial<ServerCredential>;
+        let serverUrl: string;
+        try {
+            serverUrl = validateServerUrl(credential.serverUrl || '').url;
+        } catch {
+            return undefined;
+        }
+        if (expectedServerUrl && serverUrl !== validateServerUrl(expectedServerUrl).url) return undefined;
+        if (
+            typeof credential.userId !== 'string'
+            || credential.userId.length > 4096
+            || typeof credential.userEmail !== 'string'
+            || credential.userEmail.length > 4096
+            || !credential.identity
+            || typeof credential.identity.csrfToken !== 'string'
+            || credential.identity.csrfToken.length === 0
+            || credential.identity.csrfToken.length > 65536
+            || /[\r\n\0]/.test(credential.identity.csrfToken)
+            || typeof credential.identity.cookies !== 'string'
+            || credential.identity.cookies.length === 0
+            || credential.identity.cookies.length > 65536
+            || /[\r\n\0]/.test(credential.identity.cookies)
+        ) {
+            return undefined;
+        }
+        return {
+            serverUrl,
+            userId: credential.userId,
+            userEmail: credential.userEmail,
+            identity: {
+                csrfToken: credential.identity.csrfToken,
+                cookies: credential.identity.cookies,
+            },
+        };
     }
 
     /**
      * Store credentials for a server
      */
     async storeCredential(credential: ServerCredential): Promise<void> {
-        const key = this.getKey(credential.serverUrl);
-        await this.secretStorage.store(key, JSON.stringify(credential));
+        const validated = this.validateCredential(credential);
+        if (!validated) throw new Error('Refusing to store invalid Overleaf credentials.');
+        const key = this.getKey(validated.serverUrl);
+        await this.secretStorage.store(key, JSON.stringify(validated));
     }
 
     /**
@@ -69,10 +113,12 @@ export class CredentialManager {
      */
     async getCredential(serverUrl: string): Promise<ServerCredential | undefined> {
         const key = this.getKey(serverUrl);
-        const stored = await this.secretStorage.get(key);
+        const legacyKey = this.getLegacyKey(serverUrl);
+        const stored = await this.secretStorage.get(key)
+            ?? (legacyKey !== key ? await this.secretStorage.get(legacyKey) : undefined);
         if (stored) {
             try {
-                return JSON.parse(stored) as ServerCredential;
+                return this.validateCredential(JSON.parse(stored), serverUrl);
             } catch {
                 return undefined;
             }
@@ -87,6 +133,8 @@ export class CredentialManager {
     async deleteCredential(serverUrl: string): Promise<void> {
         const key = this.getKey(serverUrl);
         await this.secretStorage.delete(key);
+        const legacyKey = this.getLegacyKey(serverUrl);
+        if (legacyKey !== key) await this.secretStorage.delete(legacyKey);
     }
 
     /**
@@ -101,7 +149,12 @@ export class CredentialManager {
      * Get the default server URL
      */
     getDefaultServer(): string {
-        return vscode.workspace.getConfiguration('localleaf').get('defaultServer', DEFAULT_SERVER);
+        const configured = vscode.workspace.getConfiguration('localleaf').get('defaultServer', DEFAULT_SERVER);
+        try {
+            return validateServerUrl(configured).url;
+        } catch {
+            return DEFAULT_SERVER;
+        }
     }
 
     /**

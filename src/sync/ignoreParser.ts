@@ -7,6 +7,11 @@ import * as vscode from 'vscode';
 import { minimatch } from 'minimatch';
 import { IGNORE_FILE, VAR_MAIN_TEX, VAR_MAIN_PDF, DEFAULT_IGNORE_PATTERNS } from '../consts';
 import { ProjectSettings } from '../utils/settingsManager';
+import { assertSafeWorkspacePath, isFileNotFoundError } from '../utils/pathSafety';
+
+function escapeGlobLiteral(value: string): string {
+    return value.replace(/([*?\[\]{}()!+@\\])/g, '\\$1');
+}
 
 /**
  * Ignore Parser - handles .leafignore patterns
@@ -33,11 +38,12 @@ export class IgnoreParser {
     async load(): Promise<void> {
         try {
             const ignoreFilePath = this.getIgnoreFilePath();
+            await assertSafeWorkspacePath(this.workspaceFolder, ignoreFilePath);
             const content = await vscode.workspace.fs.readFile(ignoreFilePath);
             const text = new TextDecoder().decode(content);
             this.patterns = this.parseIgnoreFile(text);
-        } catch {
-            // File doesn't exist, use defaults
+        } catch (error) {
+            if (!isFileNotFoundError(error)) throw error;
             this.patterns = [...DEFAULT_IGNORE_PATTERNS];
         }
         this.resolveVariables();
@@ -57,22 +63,22 @@ export class IgnoreParser {
      * Resolve variables like $MAIN_TEX and $MAIN_PDF
      */
     private resolveVariables(): void {
-        this.resolvedPatterns = this.patterns.map(pattern => {
+        this.resolvedPatterns = this.patterns.flatMap(pattern => {
             let resolved = pattern;
 
             // Resolve $MAIN_TEX
             if (resolved.includes(VAR_MAIN_TEX)) {
-                const mainTex = this.settings?.mainTex || 'main.tex';
-                resolved = resolved.replace(VAR_MAIN_TEX, mainTex);
+                if (!this.settings?.mainTex) return [];
+                resolved = resolved.replace(VAR_MAIN_TEX, escapeGlobLiteral(this.settings.mainTex));
             }
 
             // Resolve $MAIN_PDF
             if (resolved.includes(VAR_MAIN_PDF)) {
-                const mainPdf = this.settings?.mainPdf || 'main.pdf';
-                resolved = resolved.replace(VAR_MAIN_PDF, mainPdf);
+                if (!this.settings?.mainPdf) return [];
+                resolved = resolved.replace(VAR_MAIN_PDF, escapeGlobLiteral(this.settings.mainPdf));
             }
 
-            return resolved;
+            return [resolved];
         });
     }
 
@@ -130,8 +136,10 @@ export class IgnoreParser {
         this.resolveVariables();
 
         const content = patterns.join('\n') + '\n';
+        const ignoreFilePath = this.getIgnoreFilePath();
+        await assertSafeWorkspacePath(this.workspaceFolder, ignoreFilePath);
         await vscode.workspace.fs.writeFile(
-            this.getIgnoreFilePath(),
+            ignoreFilePath,
             new TextEncoder().encode(content)
         );
     }
@@ -171,8 +179,10 @@ $MAIN_PDF
 # LocalLeaf config directory
 .localleaf/**
 `;
+        const ignoreFilePath = this.getIgnoreFilePath();
+        await assertSafeWorkspacePath(this.workspaceFolder, ignoreFilePath);
         await vscode.workspace.fs.writeFile(
-            this.getIgnoreFilePath(),
+            ignoreFilePath,
             new TextEncoder().encode(defaultContent)
         );
         await this.load();
@@ -183,9 +193,12 @@ $MAIN_PDF
      */
     async exists(): Promise<boolean> {
         try {
-            await vscode.workspace.fs.stat(this.getIgnoreFilePath());
+            const ignoreFilePath = this.getIgnoreFilePath();
+            await assertSafeWorkspacePath(this.workspaceFolder, ignoreFilePath);
+            await vscode.workspace.fs.stat(ignoreFilePath);
             return true;
-        } catch {
+        } catch (error) {
+            if (!isFileNotFoundError(error)) throw error;
             return false;
         }
     }

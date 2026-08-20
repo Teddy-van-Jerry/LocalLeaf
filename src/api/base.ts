@@ -6,7 +6,60 @@
 import * as http from 'http';
 import * as https from 'https';
 import * as stream from 'stream';
+import type { RequestInit, Response } from 'node-fetch';
 import { Identity } from '../utils/credentialManager';
+import { validateServerUrl } from '../utils/serverUrl';
+import { validateProjectEntityName } from '../utils/pathSafety';
+
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const MAX_API_RESPONSE_BYTES = 10 * 1024 * 1024;
+const MAX_FILE_RESPONSE_BYTES = 100 * 1024 * 1024;
+const MAX_PARTIAL_DOWNLOADS = 10_000;
+
+type JsonObject = Record<string, unknown>;
+
+function asJsonObject(value: unknown): JsonObject | undefined {
+    return value !== null && typeof value === 'object' && !Array.isArray(value)
+        ? value as JsonObject
+        : undefined;
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+    return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function routeSegment(value: string, label: string): string {
+    if (typeof value !== 'string' || value.length === 0 || value.length > 1024 || value.includes('\0')) {
+        throw new Error(`Invalid Overleaf ${label}.`);
+    }
+    return encodeURIComponent(value);
+}
+
+function entityRouteSegment(entityType: string): string {
+    if (entityType !== 'doc' && entityType !== 'file' && entityType !== 'folder') {
+        throw new Error(`Invalid Overleaf entity type: ${entityType}`);
+    }
+    return entityType;
+}
+
+function mergeCookieHeaders(...headers: Array<string | undefined>): string {
+    const cookies = new Map<string, string>();
+    for (const header of headers) {
+        for (const rawPair of header?.split(';') || []) {
+            const pair = rawPair.trim();
+            const separator = pair.indexOf('=');
+            if (separator <= 0) continue;
+            cookies.set(pair.slice(0, separator).trim(), pair);
+        }
+    }
+    return [...cookies.values()].join('; ');
+}
+
+class ApiHttpError extends Error {
+    constructor(message: string, readonly status?: number) {
+        super(message);
+    }
+}
 
 export interface ProjectInfo {
     id: string;
@@ -41,6 +94,16 @@ export interface ProjectEntity {
     members: Array<{ _id: string; email: string; first_name: string; last_name?: string; privileges: string }>;
 }
 
+export interface ProjectDetails {
+    projectId: string;
+    projectName?: string;
+    rootDocId?: string;
+    userId?: string;
+    userEmail?: string;
+    compiler?: string;
+    rootFolder?: FolderEntity[];
+}
+
 export type AuthErrorType = 'session_expired' | 'invalid_credentials';
 
 export interface ResponseSchema {
@@ -61,23 +124,111 @@ export class BaseAPI {
     private url: string;
     private agent: http.Agent | https.Agent;
     private identity?: Identity;
+    private readonly activeRequests = new Set<AbortController>();
+    private disposed = false;
 
     constructor(url: string) {
-        this.url = url.endsWith('/') ? url : url + '/';
-        this.agent = new URL(url).protocol === 'http:'
+        const server = validateServerUrl(url);
+        this.url = `${server.url}/`;
+        this.agent = server.parsed.protocol === 'http:'
             ? new http.Agent({ keepAlive: true })
             : new https.Agent({ keepAlive: true });
+    }
+
+    private async fetchRoute(
+        route: string,
+        options: RequestInit,
+        maxResponseBytes: number = MAX_API_RESPONSE_BYTES,
+    ): Promise<Response> {
+        if (this.disposed) {
+            throw new Error('Overleaf request cancelled because the sync session was closed.');
+        }
+
+        const fetch = (await import('node-fetch')).default;
+        const controller = new AbortController();
+        this.activeRequests.add(controller);
+        const timeout = setTimeout(() => controller.abort(), DEFAULT_REQUEST_TIMEOUT_MS);
+        let released = false;
+        const release = () => {
+            if (released) return;
+            released = true;
+            clearTimeout(timeout);
+            this.activeRequests.delete(controller);
+        };
+
+        try {
+            const response = await fetch(this.url + route, {
+                redirect: 'manual',
+                agent: this.agent,
+                ...options,
+                signal: controller.signal,
+                size: maxResponseBytes,
+            });
+            if (response.body) {
+                response.body.once('end', release);
+                response.body.once('close', release);
+                response.body.once('error', release);
+            } else {
+                release();
+            }
+            return response;
+        } catch (error) {
+            release();
+            if (controller.signal.aborted) {
+                const reason = this.disposed ? 'sync session was closed' : 'request timed out';
+                throw new Error(`Overleaf ${reason}.`);
+            }
+            throw error;
+        }
+    }
+
+    private async responseError(response: Response): Promise<ResponseSchema> {
+        let detail = '';
+        try {
+            detail = await response.text();
+        } catch {
+            detail = response.statusText;
+        }
+        if (detail.length > 4096) {
+            detail = `${detail.slice(0, 4096)}…`;
+        }
+        const authError = response.status === 401 || response.status === 403
+            ? 'session_expired' as const
+            : undefined;
+        return {
+            type: 'error',
+            message: authError ? 'Session expired' : `${response.status}: ${detail || response.statusText}`,
+            authError,
+        };
+    }
+
+    private discardResponseBody(response: Response): void {
+        response.body?.resume();
+    }
+
+    private getResponseCookies(response: Response): string {
+        const setCookieHeaders = response.headers.raw()['set-cookie'] || [];
+        return mergeCookieHeaders(...setCookieHeaders.map(header => header.split(';', 1)[0]));
+    }
+
+    /** Abort all active requests and remove the in-memory identity. */
+    dispose(): void {
+        if (this.disposed) return;
+        this.disposed = true;
+        this.identity = undefined;
+        for (const controller of this.activeRequests) {
+            controller.abort();
+        }
+        this.activeRequests.clear();
+        this.agent.destroy();
     }
 
     /**
      * Get CSRF token from login page
      */
     private async getCsrfToken(): Promise<Identity> {
-        const fetch = (await import('node-fetch')).default;
-        const res = await fetch(this.url + 'login', {
+        const res = await this.fetchRoute('login', {
             method: 'GET',
-            redirect: 'manual',
-            agent: this.agent,
         });
         const body = await res.text();
         const match = body.match(/<input.*name="_csrf".*value="([^"]*)"/);
@@ -85,8 +236,7 @@ export class BaseAPI {
             throw new Error('Failed to get CSRF token.');
         }
         const csrfToken = match[1];
-        const setCookieHeader = res.headers.raw()['set-cookie'];
-        const cookies = setCookieHeader ? setCookieHeader[0].split(';')[0] : '';
+        const cookies = this.getResponseCookies(res);
         return { csrfToken, cookies };
     }
 
@@ -94,11 +244,8 @@ export class BaseAPI {
      * Get user ID from project page (validates cookies)
      */
     private async getUserId(cookies: string): Promise<{ userId: string; userEmail: string; csrfToken: string } | undefined> {
-        const fetch = (await import('node-fetch')).default;
-        const res = await fetch(this.url + 'project', {
+        const res = await this.fetchRoute('project', {
             method: 'GET',
-            redirect: 'manual',
-            agent: this.agent,
             headers: {
                 'Connection': 'keep-alive',
                 'Cookie': cookies,
@@ -124,23 +271,18 @@ export class BaseAPI {
      * Update cookies with socket.io session
      */
     async updateCookies(identity: Identity): Promise<Identity> {
-        const fetch = (await import('node-fetch')).default;
-        const res = await fetch(this.url + 'socket.io/socket.io.js', {
+        const res = await this.fetchRoute('socket.io/socket.io.js', {
             method: 'GET',
-            redirect: 'manual',
-            agent: this.agent,
             headers: {
                 'Connection': 'keep-alive',
                 'Cookie': identity.cookies,
             }
         });
-        const header = res.headers.raw()['set-cookie'];
-        if (header !== undefined) {
-            const cookies = header[0].split(';')[0];
-            if (cookies) {
-                identity.cookies = `${identity.cookies}; ${cookies}`;
-            }
+        const cookies = this.getResponseCookies(res);
+        if (cookies) {
+            identity.cookies = mergeCookieHeaders(identity.cookies, cookies);
         }
+        this.discardResponseBody(res);
         return identity;
     }
 
@@ -148,6 +290,14 @@ export class BaseAPI {
      * Login with cookies (recommended for www.overleaf.com)
      */
     async cookiesLogin(cookies: string): Promise<ResponseSchema> {
+        if (
+            typeof cookies !== 'string'
+            || cookies.length === 0
+            || cookies.length > 65536
+            || /[\r\n\0]/.test(cookies)
+        ) {
+            return { type: 'error', message: 'The Overleaf cookie header is invalid.' };
+        }
         const res = await this.getUserId(cookies);
         if (res) {
             const { userId, userEmail, csrfToken } = res;
@@ -168,12 +318,9 @@ export class BaseAPI {
      * Login with email and password (not available for www.overleaf.com due to SSO/captcha)
      */
     async passportLogin(email: string, password: string): Promise<ResponseSchema> {
-        const fetch = (await import('node-fetch')).default;
         const identity = await this.getCsrfToken();
-        const res = await fetch(this.url + 'login', {
+        const res = await this.fetchRoute('login', {
             method: 'POST',
-            redirect: 'manual',
-            agent: this.agent,
             headers: {
                 'Accept': '*/*',
                 'Accept-Encoding': 'gzip, deflate, br',
@@ -189,18 +336,21 @@ export class BaseAPI {
             const text = await res.text();
             const redirect = text.match(/Found. Redirecting to (.*)/)?.[1];
             if (redirect === '/project') {
-                const newCookies = res.headers.raw()['set-cookie'][0];
+                const newCookies = mergeCookieHeaders(identity.cookies, this.getResponseCookies(res));
+                if (!newCookies) return { type: 'error', message: 'Login returned no session cookie.' };
                 return this.cookiesLogin(newCookies);
             }
             return { type: 'error', message: `Redirecting to ${redirect}` };
         } else if (res.status === 200) {
-            const json = await res.json() as any;
-            return { type: 'error', message: json.message?.message || 'Login failed' };
+            const json = asJsonObject(await res.json());
+            const message = asJsonObject(json?.message);
+            return { type: 'error', message: nonEmptyString(message?.message) || 'Login failed' };
         } else if (res.status === 401) {
-            const json = await res.json() as any;
-            return { type: 'error', message: json.message?.text || 'Unauthorized' };
+            const json = asJsonObject(await res.json());
+            const message = asJsonObject(json?.message);
+            return { type: 'error', message: nonEmptyString(message?.text) || 'Unauthorized' };
         }
-        return { type: 'error', message: `${res.status}: ${await res.text()}` };
+        return this.responseError(res);
     }
 
     /**
@@ -222,18 +372,23 @@ export class BaseAPI {
      * Initialize Socket.io connection
      * Reference: Overleaf-Workshop base.ts _initSocketV0
      */
-    initSocket(identity: Identity, query?: string): any {
+    initSocket(identity: Identity, query?: string): SocketIOClient.Socket {
         const socketUrl = new URL(this.url).origin + (query ?? '');
 
-        const io = require('socket.io-client');
-        const socket = io.connect(socketUrl, {
+        const io: SocketIOClientStatic = require('socket.io-client');
+        const options: SocketIOClient.ConnectOpts & {
+            reconnect: boolean;
+            'force new connection': boolean;
+            extraHeaders: Record<string, string>;
+        } = {
             reconnect: false,
             'force new connection': true,
             extraHeaders: {
                 'Origin': new URL(this.url).origin,
                 'Cookie': identity.cookies,
             },
-        });
+        };
+        const socket = io.connect(socketUrl, options);
 
         return socket;
     }
@@ -251,17 +406,14 @@ export class BaseAPI {
             return { type: 'error', message: 'Not authenticated' };
         }
 
-        const fetch = (await import('node-fetch')).default;
         const headers: Record<string, string> = {
             'Connection': 'keep-alive',
             'Cookie': this.identity.cookies,
             ...extraHeaders,
         };
 
-        let fetchOptions: any = {
+        const fetchOptions: RequestInit = {
             method,
-            redirect: 'manual',
-            agent: this.agent,
             headers,
         };
 
@@ -274,15 +426,13 @@ export class BaseAPI {
             headers['X-Csrf-Token'] = this.identity.csrfToken;
         }
 
-        const res = await fetch(this.url + route, fetchOptions);
+        const res = await this.fetchRoute(route, fetchOptions);
 
         if (res.status === 200 || res.status === 204) {
+            this.discardResponseBody(res);
             return { type: 'success' };
         }
-        if (res.status === 403 || res.status === 401) {
-            return { type: 'error', message: 'Session expired', authError: 'session_expired' };
-        }
-        return { type: 'error', message: `${res.status}: ${await res.text()}` };
+        return this.responseError(res);
     }
 
     /**
@@ -293,38 +443,75 @@ export class BaseAPI {
             throw new Error('Not authenticated');
         }
 
-        const fetch = (await import('node-fetch')).default;
         const content: Buffer[] = [];
+        let offset = 0;
 
-        while (true) {
-            const res = await fetch(this.url + route, {
+        for (let requestCount = 0; requestCount < MAX_PARTIAL_DOWNLOADS; requestCount++) {
+            const headers: Record<string, string> = {
+                'Connection': 'keep-alive',
+                'Cookie': this.identity.cookies,
+            };
+            if (offset > 0) {
+                headers.Range = `bytes=${offset}-`;
+            }
+
+            const res = await this.fetchRoute(route, {
                 method: 'GET',
-                redirect: 'manual',
-                agent: this.agent,
-                headers: {
-                    'Connection': 'keep-alive',
-                    'Cookie': this.identity.cookies,
-                },
-            });
+                headers,
+            }, MAX_FILE_RESPONSE_BYTES);
 
             if (res.status === 200) {
-                content.push(await res.buffer());
-                break;
-            } else if (res.status === 206) {
-                content.push(await res.buffer());
-            } else {
-                break;
+                if (offset !== 0) {
+                    this.discardResponseBody(res);
+                    throw new ApiHttpError('The Overleaf server stopped a partial download unexpectedly.');
+                }
+                return await res.buffer();
+            }
+
+            if (res.status === 401 || res.status === 403) {
+                this.discardResponseBody(res);
+                throw new ApiHttpError('Session expired', res.status);
+            }
+            if (res.status !== 206) {
+                const failure = await this.responseError(res);
+                throw new ApiHttpError(failure.message || 'File download failed', res.status);
+            }
+
+            const contentRange = res.headers.get('content-range');
+            const match = contentRange?.match(/^bytes (\d+)-(\d+)\/(\d+)$/i);
+            if (!match) {
+                this.discardResponseBody(res);
+                throw new ApiHttpError('The Overleaf server returned an invalid partial download range.');
+            }
+
+            const start = Number(match[1]);
+            const end = Number(match[2]);
+            const total = Number(match[3]);
+            if (
+                !Number.isSafeInteger(start)
+                || !Number.isSafeInteger(end)
+                || !Number.isSafeInteger(total)
+                || start !== offset
+                || end < start
+                || end >= total
+                || total > MAX_FILE_RESPONSE_BYTES
+            ) {
+                this.discardResponseBody(res);
+                throw new ApiHttpError('The Overleaf server returned an unsafe partial download range.');
+            }
+
+            const chunk = await res.buffer();
+            if (chunk.length !== end - start + 1) {
+                throw new ApiHttpError('The Overleaf server returned an incomplete partial download.');
+            }
+            content.push(chunk);
+            offset = end + 1;
+            if (offset === total) {
+                return Buffer.concat(content, total);
             }
         }
 
-        return Buffer.concat(content);
-    }
-
-    /**
-     * Logout from server
-     */
-    async logout(): Promise<ResponseSchema> {
-        return this.request('POST', 'logout');
+        throw new ApiHttpError('The Overleaf server returned too many partial download responses.');
     }
 
     /**
@@ -335,11 +522,8 @@ export class BaseAPI {
             return { type: 'error', message: 'Not authenticated' };
         }
 
-        const fetch = (await import('node-fetch')).default;
-        const res = await fetch(this.url + 'user/projects', {
+        const res = await this.fetchRoute('user/projects', {
             method: 'GET',
-            redirect: 'manual',
-            agent: this.agent,
             headers: {
                 'Connection': 'keep-alive',
                 'Cookie': this.identity.cookies,
@@ -347,29 +531,57 @@ export class BaseAPI {
         });
 
         if (res.status === 200) {
-            const data = await res.json() as any;
-            const projects: ProjectInfo[] = data.projects.map((p: any) => ({
-                id: p._id,
-                name: p.name,
-                lastUpdated: p.lastUpdated,
-                accessLevel: p.accessLevel,
-                archived: p.archived,
-                trashed: p.trashed,
-            }));
+            const data = asJsonObject(await res.json());
+            if (!Array.isArray(data?.projects)) {
+                return { type: 'error', message: 'Overleaf returned an invalid project list.' };
+            }
+            const projects: ProjectInfo[] = data.projects.flatMap((value: unknown) => {
+                const p = asJsonObject(value);
+                if (
+                    !p
+                    || typeof p._id !== 'string'
+                    || p._id.length === 0
+                    || p._id.length > 1024
+                    || typeof p.name !== 'string'
+                    || p.name.length === 0
+                    || p.name.length > 4096
+                ) return [];
+                const accessLevel: ProjectInfo['accessLevel'] = p.accessLevel === 'owner'
+                    || p.accessLevel === 'collaborator'
+                    || p.accessLevel === 'readOnly'
+                    ? p.accessLevel
+                    : 'readOnly';
+                return [{
+                    id: p._id,
+                    name: p.name,
+                    lastUpdated: typeof p.lastUpdated === 'string' ? p.lastUpdated : undefined,
+                    accessLevel,
+                    archived: Boolean(p.archived),
+                    trashed: Boolean(p.trashed),
+                }];
+            });
             return { type: 'success', projects };
         }
-        if (res.status === 403 || res.status === 401) {
-            return { type: 'error', message: 'Session expired', authError: 'session_expired' };
-        }
-        return { type: 'error', message: `${res.status}: ${await res.text()}` };
+        return this.responseError(res);
     }
 
     /**
      * Get file content
      */
     async getFile(projectId: string, fileId: string): Promise<ResponseSchema> {
-        const content = await this.download(`project/${projectId}/file/${fileId}`);
-        return { type: 'success', content: new Uint8Array(content) };
+        try {
+            const content = await this.download(
+                `project/${routeSegment(projectId, 'project ID')}/file/${routeSegment(fileId, 'file ID')}`
+            );
+            return { type: 'success', content: new Uint8Array(content) };
+        } catch (error) {
+            const status = error instanceof ApiHttpError ? error.status : undefined;
+            return {
+                type: 'error',
+                message: error instanceof Error ? error.message : String(error),
+                authError: status === 401 || status === 403 ? 'session_expired' : undefined,
+            };
+        }
     }
 
     /**
@@ -386,9 +598,9 @@ export class BaseAPI {
         }
 
         const FormData = require('form-data');
-        const fetch = (await import('node-fetch')).default;
         const mimeTypes = require('mime-types');
 
+        validateProjectEntityName(filename);
         const fileStream = stream.Readable.from(fileContent);
         const formData = new FormData();
         const mimeType = mimeTypes.lookup(filename);
@@ -398,12 +610,10 @@ export class BaseAPI {
         formData.append('type', mimeType || 'text/plain');
         formData.append('qqfile', fileStream, { filename });
 
-        const res = await fetch(
-            this.url + `project/${projectId}/upload?folder_id=${parentFolderId}`,
+        const res = await this.fetchRoute(
+            `project/${routeSegment(projectId, 'project ID')}/upload?folder_id=${routeSegment(parentFolderId, 'folder ID')}`,
             {
                 method: 'POST',
-                redirect: 'manual',
-                agent: this.agent,
                 headers: {
                     'Connection': 'keep-alive',
                     'Cookie': this.identity.cookies,
@@ -414,32 +624,34 @@ export class BaseAPI {
         );
 
         if (res.ok) {
-            let uploadData: any;
+            let uploadData: unknown;
             try {
                 uploadData = await res.json();
             } catch {
                 // Some Overleaf versions return an empty successful response.
             }
 
-            const rawEntity = uploadData?.file || uploadData?.entity || uploadData;
-            const entityId = rawEntity?._id || rawEntity?.id || uploadData?.entity_id;
-            const rawEntityType = rawEntity?._type || rawEntity?.type || uploadData?.entity_type;
+            const uploadObject = asJsonObject(uploadData);
+            const rawEntity = asJsonObject(uploadObject?.file)
+                || asJsonObject(uploadObject?.entity)
+                || uploadObject;
+            const entityId = nonEmptyString(rawEntity?._id)
+                || nonEmptyString(rawEntity?.id)
+                || nonEmptyString(uploadObject?.entity_id);
+            const rawEntityType = rawEntity?._type || rawEntity?.type || uploadObject?.entity_type;
             const entityType: FileEntity['_type'] =
                 rawEntityType === 'doc' || rawEntityType === 'folder' ? rawEntityType : 'file';
             const file: FileEntity | undefined = entityId
                 ? {
                     _id: entityId,
                     _type: entityType,
-                    name: rawEntity?.name || filename,
+                    name: filename,
                 }
                 : undefined;
 
             return { type: 'success', file };
         }
-        if (res.status === 403 || res.status === 401) {
-            return { type: 'error', message: 'Session expired', authError: 'session_expired' };
-        }
-        return { type: 'error', message: `${res.status}: ${await res.text()}` };
+        return this.responseError(res);
     }
 
     /**
@@ -450,11 +662,9 @@ export class BaseAPI {
             return { type: 'error', message: 'Not authenticated' };
         }
 
-        const fetch = (await import('node-fetch')).default;
-        const res = await fetch(this.url + `project/${projectId}/doc`, {
+        validateProjectEntityName(filename);
+        const res = await this.fetchRoute(`project/${routeSegment(projectId, 'project ID')}/doc`, {
             method: 'POST',
-            redirect: 'manual',
-            agent: this.agent,
             headers: {
                 'Connection': 'keep-alive',
                 'Cookie': this.identity.cookies,
@@ -471,14 +681,14 @@ export class BaseAPI {
         if (res.ok) {
             let doc: FileEntity | undefined;
             try {
-                const data = await res.json() as any;
-                const rawDoc = data?.doc || data;
-                const docId = rawDoc?._id || rawDoc?.id;
+                const data = asJsonObject(await res.json());
+                const rawDoc = asJsonObject(data?.doc) || data;
+                const docId = nonEmptyString(rawDoc?._id) || nonEmptyString(rawDoc?.id);
                 if (docId) {
                     doc = {
                         _id: docId,
                         _type: 'doc',
-                        name: rawDoc?.name || filename,
+                        name: filename,
                     };
                 }
             } catch {
@@ -487,10 +697,7 @@ export class BaseAPI {
 
             return { type: 'success', doc };
         }
-        if (res.status === 403 || res.status === 401) {
-            return { type: 'error', message: 'Session expired', authError: 'session_expired' };
-        }
-        return { type: 'error', message: `${res.status}: ${await res.text()}` };
+        return this.responseError(res);
     }
 
     /**
@@ -502,11 +709,9 @@ export class BaseAPI {
             return { type: 'error', message: 'Not authenticated' };
         }
 
-        const fetch = (await import('node-fetch')).default;
-        const res = await fetch(this.url + `project/${projectId}/folder`, {
+        validateProjectEntityName(folderName);
+        const res = await this.fetchRoute(`project/${routeSegment(projectId, 'project ID')}/folder`, {
             method: 'POST',
-            redirect: 'manual',
-            agent: this.agent,
             headers: {
                 'Connection': 'keep-alive',
                 'Cookie': this.identity.cookies,
@@ -520,27 +725,30 @@ export class BaseAPI {
             }),
         });
 
-        if (res.status === 200) {
+        if (res.ok) {
             // Parse response to get folder entity with _id
-            const data = await res.json() as any;
-            const folder: FileEntity = {
-                _id: data._id || data.id,
-                _type: 'folder',
-                name: data.name || folderName,
-            };
+            const data = asJsonObject(await res.json());
+            const folderId = nonEmptyString(data?._id) || nonEmptyString(data?.id);
+            const folder: FileEntity | undefined = folderId
+                ? {
+                    _id: folderId,
+                    _type: 'folder',
+                    name: folderName,
+                }
+                : undefined;
             return { type: 'success', folder };
         }
-        if (res.status === 403 || res.status === 401) {
-            return { type: 'error', message: 'Session expired', authError: 'session_expired' };
-        }
-        return { type: 'error', message: `${res.status}: ${await res.text()}` };
+        return this.responseError(res);
     }
 
     /**
      * Delete an entity (doc, file, or folder)
      */
     async deleteEntity(projectId: string, entityType: string, entityId: string): Promise<ResponseSchema> {
-        return this.request('DELETE', `project/${projectId}/${entityType}/${entityId}`);
+        return this.request(
+            'DELETE',
+            `project/${routeSegment(projectId, 'project ID')}/${entityRouteSegment(entityType)}/${routeSegment(entityId, 'entity ID')}`
+        );
     }
 
     /**
@@ -556,11 +764,10 @@ export class BaseAPI {
             return { type: 'error', message: 'Not authenticated' };
         }
 
-        const fetch = (await import('node-fetch')).default;
-        const res = await fetch(this.url + `project/${projectId}/${entityType}/${entityId}/rename`, {
+        validateProjectEntityName(newName);
+        const res = await this.fetchRoute(
+            `project/${routeSegment(projectId, 'project ID')}/${entityRouteSegment(entityType)}/${routeSegment(entityId, 'entity ID')}/rename`, {
             method: 'POST',
-            redirect: 'manual',
-            agent: this.agent,
             headers: {
                 'Connection': 'keep-alive',
                 'Cookie': this.identity.cookies,
@@ -571,15 +778,13 @@ export class BaseAPI {
                 _csrf: this.identity.csrfToken,
                 name: newName,
             }),
-        });
+            });
 
         if (res.status === 200 || res.status === 204) {
+            this.discardResponseBody(res);
             return { type: 'success' };
         }
-        if (res.status === 403 || res.status === 401) {
-            return { type: 'error', message: 'Session expired', authError: 'session_expired' };
-        }
-        return { type: 'error', message: `${res.status}: ${await res.text()}` };
+        return this.responseError(res);
     }
 
     /**
@@ -595,11 +800,9 @@ export class BaseAPI {
             return { type: 'error', message: 'Not authenticated' };
         }
 
-        const fetch = (await import('node-fetch')).default;
-        const res = await fetch(this.url + `project/${projectId}/${entityType}/${entityId}/move`, {
+        const res = await this.fetchRoute(
+            `project/${routeSegment(projectId, 'project ID')}/${entityRouteSegment(entityType)}/${routeSegment(entityId, 'entity ID')}/move`, {
             method: 'POST',
-            redirect: 'manual',
-            agent: this.agent,
             headers: {
                 'Connection': 'keep-alive',
                 'Cookie': this.identity.cookies,
@@ -610,40 +813,27 @@ export class BaseAPI {
                 _csrf: this.identity.csrfToken,
                 folder_id: newParentFolderId,
             }),
-        });
+            });
 
         if (res.status === 200 || res.status === 204) {
+            this.discardResponseBody(res);
             return { type: 'success' };
         }
-        if (res.status === 403 || res.status === 401) {
-            return { type: 'error', message: 'Session expired', authError: 'session_expired' };
-        }
-        return { type: 'error', message: `${res.status}: ${await res.text()}` };
-    }
-
-    /**
-     * Get the server URL
-     */
-    getUrl(): string {
-        return this.url;
+        return this.responseError(res);
     }
 
     /**
      * Get project details via HTTP (alternative to socket.io joinProject)
      * Fetches project page and extracts metadata from HTML
      */
-    async getProjectDetails(projectId: string): Promise<ResponseSchema & { projectData?: any }> {
+    async getProjectDetails(projectId: string): Promise<ResponseSchema & { projectData?: ProjectDetails }> {
         if (!this.identity) {
             return { type: 'error', message: 'Not authenticated' };
         }
 
-        const fetch = (await import('node-fetch')).default;
-
         // Get project page which contains metadata in HTML
-        const res = await fetch(this.url + `project/${projectId}`, {
+        const res = await this.fetchRoute(`project/${routeSegment(projectId, 'project ID')}`, {
             method: 'GET',
-            redirect: 'manual',
-            agent: this.agent,
             headers: {
                 'Connection': 'keep-alive',
                 'Cookie': this.identity.cookies,
@@ -659,11 +849,11 @@ export class BaseAPI {
                 return match ? match[1] : undefined;
             };
 
-            const extractJsonMeta = (name: string): any => {
+            const extractJsonMeta = (name: string): unknown => {
                 const match = body.match(new RegExp(`<meta\\s+name="${name}"\\s+data-type="json"\\s+content="([^"]*)"`));
                 if (match) {
                     try {
-                        return JSON.parse(match[1].replace(/&quot;/g, '"'));
+                        return JSON.parse(match[1].replace(/&quot;/g, '"')) as unknown;
                     } catch {
                         return undefined;
                     }
@@ -671,53 +861,21 @@ export class BaseAPI {
                 return undefined;
             };
 
-            const projectData = {
+            const rootFolder = extractJsonMeta('ol-rootFolder');
+            const projectData: ProjectDetails = {
                 projectId: extractMeta('ol-project_id') || projectId,
                 projectName: extractMeta('ol-projectName'),
                 rootDocId: extractMeta('ol-rootDoc_id'),
                 userId: extractMeta('ol-user_id'),
                 userEmail: extractMeta('ol-usersEmail'),
                 compiler: extractMeta('ol-compiler'),
-                rootFolder: extractJsonMeta('ol-rootFolder'),
+                rootFolder: Array.isArray(rootFolder) ? rootFolder as FolderEntity[] : undefined,
             };
 
             return { type: 'success', projectData };
         }
 
-        if (res.status === 403 || res.status === 401) {
-            return { type: 'error', message: 'Session expired', authError: 'session_expired' };
-        }
-        return { type: 'error', message: `${res.status}: Failed to get project details` };
-    }
-
-    /**
-     * Get project entities (file tree) via HTTP
-     */
-    async getProjectEntities(projectId: string): Promise<ResponseSchema & { entities?: Array<{ path: string; type: string }> }> {
-        if (!this.identity) {
-            return { type: 'error', message: 'Not authenticated' };
-        }
-
-        const fetch = (await import('node-fetch')).default;
-        const res = await fetch(this.url + `project/${projectId}/entities`, {
-            method: 'GET',
-            redirect: 'manual',
-            agent: this.agent,
-            headers: {
-                'Connection': 'keep-alive',
-                'Cookie': this.identity.cookies,
-            },
-        });
-
-        if (res.status === 200) {
-            const data = await res.json() as any;
-            return { type: 'success', entities: data.entities };
-        }
-
-        if (res.status === 403 || res.status === 401) {
-            return { type: 'error', message: 'Session expired', authError: 'session_expired' };
-        }
-        return { type: 'error', message: `${res.status}: ${await res.text()}` };
+        return this.responseError(res);
     }
 
     /**
@@ -728,26 +886,24 @@ export class BaseAPI {
             return { type: 'error', message: 'Not authenticated' };
         }
 
-        const fetch = (await import('node-fetch')).default;
-        const res = await fetch(this.url + `project/${projectId}/doc/${docId}`, {
+        const res = await this.fetchRoute(
+            `project/${routeSegment(projectId, 'project ID')}/doc/${routeSegment(docId, 'document ID')}`, {
             method: 'GET',
-            redirect: 'manual',
-            agent: this.agent,
             headers: {
                 'Connection': 'keep-alive',
                 'Cookie': this.identity.cookies,
             },
-        });
+            });
 
         if (res.status === 200) {
-            const data = await res.json() as any;
-            return { type: 'success', lines: data.lines };
+            const data = asJsonObject(await res.json());
+            if (!Array.isArray(data?.lines) || data.lines.some((line: unknown) => typeof line !== 'string')) {
+                return { type: 'error', message: 'Overleaf returned invalid document content.' };
+            }
+            return { type: 'success', lines: data.lines as string[] };
         }
 
-        if (res.status === 403 || res.status === 401) {
-            return { type: 'error', message: 'Session expired', authError: 'session_expired' };
-        }
-        return { type: 'error', message: `${res.status}: ${await res.text()}` };
+        return this.responseError(res);
     }
 
     /**

@@ -3,7 +3,6 @@
  * Adapted from Overleaf-Workshop
  */
 
-import { promisify } from 'util';
 import * as vscode from 'vscode';
 import { BaseAPI, ProjectEntity, FileEntity } from './base';
 import { Identity } from '../utils/credentialManager';
@@ -97,8 +96,7 @@ export interface SocketEventHandlers {
  * Reference: Overleaf-Workshop/src/api/socketio.ts
  */
 export class SocketIOAPI {
-    private socket: any;
-    private emit!: (event: string, ...args: any[]) => Promise<any[]>;
+    private socket!: SocketIOClient.Socket;
     private projectRecord?: ProjectEntity;
     private projectRecordPromise?: Promise<ProjectEntity>;
     private handlers: SocketEventHandlers[] = [];
@@ -129,36 +127,39 @@ export class SocketIOAPI {
 
         // Connect with projectId and timestamp in query
         this.projectRecordPromise = undefined;
-        const query = `?projectId=${this.projectId}&t=${Date.now()}`;
+        const query = `?projectId=${encodeURIComponent(this.projectId)}&t=${Date.now()}`;
         this.socket = this.api.initSocket(this.identity, query);
 
-        this.setupEmit();
         this.setupInternalHandlers();
     }
 
-    /**
-     * Setup promisified emit
-     * Reference: Overleaf-Workshop socketio.ts
-     */
-    private setupEmit() {
-        (this.socket.emit)[promisify.custom] = (event: string, ...args: any[]) => {
-            const timeoutPromise = new Promise<any[]>((_, reject) => {
-                setTimeout(() => {
-                    reject(new Error('Socket emit timeout'));
-                }, 5000);
+    private withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+        return new Promise<T>((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+            promise.then(
+                value => {
+                    clearTimeout(timer);
+                    resolve(value);
+                },
+                error => {
+                    clearTimeout(timer);
+                    reject(error);
+                },
+            );
+        });
+    }
+
+    private emit(event: string, ...args: unknown[]): Promise<unknown[]> {
+        const response = new Promise<unknown[]>((resolve, reject) => {
+            this.socket.emit(event, ...args, (error: unknown, ...data: unknown[]) => {
+                if (error) {
+                    reject(error instanceof Error ? error : new Error(String(error)));
+                } else {
+                    resolve(data);
+                }
             });
-            const waitPromise = new Promise<any[]>((resolve, reject) => {
-                this.socket.emit(event, ...args, (err: any, ...data: any[]) => {
-                    if (err) {
-                        reject(new Error(err));
-                    } else {
-                        resolve(data);
-                    }
-                });
-            });
-            return Promise.race([waitPromise, timeoutPromise]);
-        };
-        this.emit = promisify(this.socket.emit).bind(this.socket);
+        });
+        return this.withTimeout(response, 5000, `Socket event "${event}" timed out`);
     }
 
     /**
@@ -177,7 +178,7 @@ export class SocketIOAPI {
             this._connected = false;
         });
 
-        this.socket.on('forceDisconnect', (message: string, delay: number = 10) => {
+        this.socket.on('forceDisconnect', (message: string) => {
             log(`Force disconnected: ${message}`);
             this._connected = false;
             // Check if force disconnect is auth-related
@@ -185,7 +186,7 @@ export class SocketIOAPI {
             this.handlers.forEach(h => h.onDisconnected?.(isAuthError));
         });
 
-        this.socket.on('error', (err: any) => {
+        this.socket.on('error', (err: unknown) => {
             log(`Socket error: ${err}`);
         });
 
@@ -195,30 +196,44 @@ export class SocketIOAPI {
             this.handlers.forEach(h => h.onDisconnected?.(false));
         });
 
-        this.socket.on('connectionRejected', (err: any) => {
-            log(`Connection rejected: ${err?.message}`);
+        this.socket.on('connectionRejected', (err: unknown) => {
+            const message = err instanceof Error
+                ? err.message
+                : typeof err === 'object' && err !== null && 'message' in err
+                    ? String(err.message)
+                    : String(err);
+            log(`Connection rejected: ${message}`);
             this._connected = false;
             // Check if rejection is auth-related
-            const isAuthError = this.isAuthRelatedMessage(err?.message);
+            const isAuthError = this.isAuthRelatedMessage(message);
             this.handlers.forEach(h => h.onDisconnected?.(isAuthError));
         });
 
-        this.socket.on('connectionAccepted', (_: any, publicId: string) => {
+        this.socket.on('connectionAccepted', (_session: unknown, publicId: string) => {
             this._publicId = publicId;
             this._connected = true;
             this.handlers.forEach(h => h.onConnected?.(publicId));
         });
 
         // joinProjectResponse handler
-        this.projectRecordPromise = new Promise((resolve) => {
-            this.socket.on('joinProjectResponse', (res: any) => {
-                const publicId = res.publicId as string;
-                const project = res.project as ProjectEntity;
+        this.projectRecordPromise = new Promise((resolve, reject) => {
+            this.socket.on('joinProjectResponse', (res: unknown) => {
+                if (res === null || typeof res !== 'object') {
+                    reject(new Error('Overleaf returned an invalid project response.'));
+                    return;
+                }
+                const response = res as Record<string, unknown>;
+                const publicId = response.publicId;
+                const project = response.project;
+                if (typeof publicId !== 'string' || project === null || typeof project !== 'object') {
+                    reject(new Error('Overleaf returned incomplete project metadata.'));
+                    return;
+                }
                 this._publicId = publicId;
                 this._connected = true;
-                this.projectRecord = project;
+                this.projectRecord = project as ProjectEntity;
                 this.handlers.forEach(h => h.onConnected?.(publicId));
-                resolve(project);
+                resolve(this.projectRecord);
             });
         });
     }
@@ -301,13 +316,7 @@ export class SocketIOAPI {
             return;
         }
 
-        const timeoutPromise = new Promise<void>((_, reject) => {
-            setTimeout(() => {
-                reject(new Error('Socket handshake timeout'));
-            }, timeoutMs);
-        });
-
-        await Promise.race([this._handshakePromise, timeoutPromise]);
+        await this.withTimeout(this._handshakePromise, timeoutMs, 'Socket handshake timeout');
     }
 
     /**
@@ -318,15 +327,9 @@ export class SocketIOAPI {
         // Wait for handshake before emitting
         await this.waitForHandshake();
 
-        const timeoutPromise = new Promise<never>((_, reject) => {
-            setTimeout(() => {
-                reject(new Error('Join project timeout'));
-            }, 5000);
-        });
-
         // v2 uses joinProjectResponse event instead of callback
         if (this.projectRecordPromise) {
-            const project = await Promise.race([this.projectRecordPromise, timeoutPromise]);
+            const project = await this.withTimeout(this.projectRecordPromise, 5000, 'Join project timeout');
             log(`Connected to project (real-time)`);
             return project;
         }
@@ -337,9 +340,9 @@ export class SocketIOAPI {
      * Join a document for editing
      */
     async joinDoc(docId: string): Promise<{ lines: string[]; version: number }> {
-        const [docLinesAscii, version, _updates, _ranges] = await this.emit('joinDoc', docId, {
+        const [docLinesAscii, version] = await this.emit('joinDoc', docId, {
             encodeRanges: true,
-        }) as [string[], number, any[], any];
+        }) as [string[], number];
 
         const lines = docLinesAscii.map(line => Buffer.from(line, 'ascii').toString('utf-8'));
         return { lines, version };
@@ -418,17 +421,9 @@ export class SocketIOAPI {
      */
     disconnect() {
         this.socket.disconnect();
+        this.socket.removeAllListeners?.();
+        this.handlers = [];
         this._connected = false;
-    }
-
-    /**
-     * Reconnect to socket
-     */
-    reconnect() {
-        if (!this._connected) {
-            log('Reconnecting...');
-            this.init();
-        }
     }
 
     /**

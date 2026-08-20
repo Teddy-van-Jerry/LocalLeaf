@@ -28,5 +28,9 @@ npm-debug.log*
 # Claude Code
 CLAUDE.local.md
 
+# Local integration planning
+LOCAL_GUI_INTEGRATION_CHECKLIST.md
+local-pr3-artifacts/
+
 # Test workspace
 test-workspace/
