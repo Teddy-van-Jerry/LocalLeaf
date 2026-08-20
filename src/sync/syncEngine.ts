@@ -900,6 +900,16 @@ export class SyncEngine {
         ensureApiSuccess(result, 'Refresh project file tree');
 
         if (!result.projectData?.rootFolder) {
+            // Some self-hosted Overleaf versions expose the project tree only
+            // through Socket.IO, not in the project page metadata. In that
+            // case the live tree built during connect (and maintained by
+            // socket events) is still authoritative enough for operations
+            // such as cleaning ignored remote files. Do not discard it just
+            // because the optional HTTP refresh is unavailable.
+            if (this.fileTree.size > 0 && this.fileTreeByPath.size > 0) {
+                debugLog('HTTP project tree refresh unavailable; keeping the live project tree');
+                return;
+            }
             throw new Error('Refresh project file tree: Overleaf returned no folder tree');
         }
 

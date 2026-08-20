@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
 
 const INVALID_ENTITY_NAME = /[\\/\0-\x1f<>:"|?*]/;
 const WINDOWS_RESERVED_NAME = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
@@ -85,6 +86,61 @@ export function isFileNotFoundError(error: unknown): boolean {
     return false;
 }
 
+const WINDOWS_FILE_PATH = /^(?:[A-Za-z]:[\\/]|\\\\)/;
+
+function isWindowsFileUri(uri: vscode.Uri): boolean {
+    return uri.scheme === 'file' && (
+        WINDOWS_FILE_PATH.test(uri.fsPath)
+        || /^\/[A-Za-z]:\//.test(uri.path)
+    );
+}
+
+/**
+ * Return a slash-separated path relative to a workspace, or undefined when
+ * the target is outside it. Windows file URIs use Windows path semantics so
+ * drive letters and ordinary case differences do not produce false escapes.
+ */
+export function getWorkspaceRelativePath(
+    workspaceFolder: vscode.Uri,
+    target: vscode.Uri,
+): string | undefined {
+    const workspaceIsWindows = isWindowsFileUri(workspaceFolder);
+    const targetIsWindows = isWindowsFileUri(target);
+    if (workspaceIsWindows !== targetIsWindows) return undefined;
+
+    const caseInsensitiveOrigin = workspaceIsWindows;
+    const workspaceScheme = caseInsensitiveOrigin
+        ? workspaceFolder.scheme.toLowerCase()
+        : workspaceFolder.scheme;
+    const targetScheme = caseInsensitiveOrigin ? target.scheme.toLowerCase() : target.scheme;
+    const workspaceAuthority = caseInsensitiveOrigin
+        ? workspaceFolder.authority.toLowerCase()
+        : workspaceFolder.authority;
+    const targetAuthority = caseInsensitiveOrigin
+        ? target.authority.toLowerCase()
+        : target.authority;
+    if (workspaceScheme !== targetScheme || workspaceAuthority !== targetAuthority) {
+        return undefined;
+    }
+
+    const pathApi = workspaceIsWindows ? path.win32 : path.posix;
+    const workspacePath = workspaceIsWindows ? workspaceFolder.fsPath : workspaceFolder.path;
+    const targetPath = workspaceIsWindows ? target.fsPath : target.path;
+    const relativePath = pathApi.relative(
+        pathApi.resolve(workspacePath),
+        pathApi.resolve(targetPath),
+    );
+    if (relativePath === '') return '';
+    if (
+        pathApi.isAbsolute(relativePath)
+        || relativePath === '..'
+        || relativePath.startsWith(`..${pathApi.sep}`)
+    ) {
+        return undefined;
+    }
+    return relativePath.split(pathApi.sep).join('/');
+}
+
 /**
  * Verify that a workspace target is lexically contained and that none of its
  * existing path components is a symbolic link.
@@ -93,18 +149,8 @@ export async function assertSafeWorkspacePath(
     workspaceFolder: vscode.Uri,
     target: vscode.Uri,
 ): Promise<void> {
-    const workspacePath = workspaceFolder.path.replace(/\/+$/, '');
-    const targetPath = target.path.replace(/\/+$/, '');
-    const relativePath = targetPath === workspacePath
-        ? ''
-        : targetPath.startsWith(`${workspacePath}/`)
-            ? targetPath.slice(workspacePath.length + 1)
-            : undefined;
-    if (
-        relativePath === undefined
-        || workspaceFolder.scheme !== target.scheme
-        || workspaceFolder.authority !== target.authority
-    ) {
+    const relativePath = getWorkspaceRelativePath(workspaceFolder, target);
+    if (relativePath === undefined) {
         throw new Error(`Refusing to access a path outside the workspace: ${target.toString()}`);
     }
 

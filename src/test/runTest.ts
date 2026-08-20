@@ -113,6 +113,7 @@ function mockFileUri(fsPath: string): MockUri {
     const uriPath = `/${normalizedFsPath.replace(/\\/g, '/')}`;
     return {
         scheme: 'file',
+        authority: '',
         path: uriPath,
         fsPath: normalizedFsPath,
         toString: () => `file://${uriPath}`,
@@ -747,6 +748,37 @@ async function run(): Promise<void> {
     assert.deepStrictEqual(deleted, ['/thesis.aux']);
     assert.equal(cleanup.fileTreeByPath.has('/thesis.tex'), true);
 
+    const selfHostedRefresh = Object.create(SyncEngine.prototype) as any;
+    const liveEntry = {
+        id: 'live-id',
+        type: 'file',
+        path: '/thesis.aux',
+        name: 'thesis.aux',
+    };
+    selfHostedRefresh.settings = { getSettings: () => ({ projectId: 'project' }) };
+    selfHostedRefresh.api = {
+        getProjectDetails: async () => ({
+            type: 'success',
+            projectData: { projectId: 'project' },
+        }),
+    };
+    selfHostedRefresh.fileTree = new Map([[liveEntry.id, liveEntry]]);
+    selfHostedRefresh.fileTreeByPath = new Map([[liveEntry.path, liveEntry]]);
+    await selfHostedRefresh.refreshProjectFileTree();
+    assert.equal(selfHostedRefresh.fileTreeByPath.get(liveEntry.path), liveEntry,
+        'a self-hosted server without HTTP folder metadata must retain the live Socket.IO tree');
+
+    const unavailableRefresh = Object.create(SyncEngine.prototype) as any;
+    unavailableRefresh.settings = selfHostedRefresh.settings;
+    unavailableRefresh.api = selfHostedRefresh.api;
+    unavailableRefresh.fileTree = new Map();
+    unavailableRefresh.fileTreeByPath = new Map();
+    await assert.rejects(
+        () => unavailableRefresh.refreshProjectFileTree(),
+        /Overleaf returned no folder tree/,
+        'missing HTTP metadata must still fail when no live project tree is available',
+    );
+
     const viewsDirectory = path.join(__dirname, '..', 'views');
     const webviewFiles = [
         'projectsWebviewProvider.js',
@@ -978,10 +1010,17 @@ async function run(): Promise<void> {
     assert.match(firstNonce, /^[0-9a-f]{32}$/);
     assert.notEqual(firstNonce, secondNonce, 'CSP nonces must use cryptographic randomness');
 
-    const { assertSafeWorkspacePath, isFileNotFoundError, joinProjectPath, normalizeProjectPath } = require(
+    const {
+        assertSafeWorkspacePath,
+        getWorkspaceRelativePath,
+        isFileNotFoundError,
+        joinProjectPath,
+        normalizeProjectPath,
+    } = require(
         path.join('..', 'utils', 'pathSafety')
     ) as {
         assertSafeWorkspacePath(workspace: MockUri, target: MockUri): Promise<void>;
+        getWorkspaceRelativePath(workspace: MockUri, target: MockUri): string | undefined;
         isFileNotFoundError(error: unknown): boolean;
         joinProjectPath(parent: string, name: string, folder: boolean): string;
         normalizeProjectPath(candidate: string, allowRoot?: boolean): string;
@@ -995,9 +1034,11 @@ async function run(): Promise<void> {
     assert.throws(() => joinProjectPath('/', 'CON', false), /Unsafe Overleaf entity name/);
     const safetyRoot = mockFileUri('D:\\safety-workspace');
     const linkedTarget = mockFileUri('D:\\safety-workspace\\linked\\secret.tex');
+    const driveCaseTarget = mockFileUri('d:\\SAFETY-WORKSPACE\\chapter.tex');
     resetMockWorkspace([safetyRoot], [
         ['D:\\safety-workspace', { type: 2 }],
         ['D:\\safety-workspace\\linked', { type: 66 }],
+        ['D:\\safety-workspace\\chapter.tex', { type: 1, content: 'test' }],
     ]);
     await assert.rejects(
         () => assertSafeWorkspacePath(safetyRoot, linkedTarget),
@@ -1007,6 +1048,22 @@ async function run(): Promise<void> {
     await assert.rejects(
         () => assertSafeWorkspacePath(safetyRoot, mockFileUri('D:\\outside\\secret.tex')),
         /outside the workspace/,
+    );
+    assert.equal(
+        getWorkspaceRelativePath(safetyRoot, driveCaseTarget),
+        'chapter.tex',
+        'Windows drive and directory case differences must remain inside the workspace',
+    );
+    await assert.doesNotReject(() => assertSafeWorkspacePath(safetyRoot, driveCaseTarget));
+    assert.equal(
+        getWorkspaceRelativePath(safetyRoot, mockFileUri('D:\\safety-workspace-evil\\secret.tex')),
+        undefined,
+        'a sibling with the same textual prefix must remain outside the workspace',
+    );
+    assert.equal(
+        getWorkspaceRelativePath(safetyRoot, mockFileUri('E:\\safety-workspace\\secret.tex')),
+        undefined,
+        'a path on another Windows drive must remain outside the workspace',
     );
     assert.equal(isFileNotFoundError(new Error('ENOENT: missing file')), true);
     assert.equal(
@@ -1102,7 +1159,14 @@ async function run(): Promise<void> {
     assert.equal(pathManager.getFilePath('/safe/file.tex').fsPath, 'D:\\workspace\\safe\\file.tex');
     assert.throws(() => pathManager.getFilePath('/../outside.tex'), /Unsafe Overleaf entity name/);
     assert.throws(() => pathManager.getFilePath('/'), /workspace root/);
+    assert.equal(
+        pathManager.getRelativePath(mockFileUri('d:\\WORKSPACE\\safe\\file.tex')),
+        '/safe/file.tex',
+        'filesystem watcher URIs must tolerate Windows path casing differences',
+    );
+    assert.equal(pathManager.getRelativePath(mockFileUri('d:\\WORKSPACE')), '/');
     assert.equal(pathManager.getRelativePath(mockFileUri('D:\\workspace-evil\\file.tex')), undefined);
+    assert.equal(pathManager.getRelativePath(mockFileUri('E:\\workspace\\file.tex')), undefined);
 
     resetMockWorkspace([workspaceRoot], [
         ['D:\\workspace', { type: 2 }],

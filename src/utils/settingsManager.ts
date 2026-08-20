@@ -6,7 +6,12 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { CONFIG_DIR, SETTINGS_FILE, DEFAULT_SERVER, IGNORE_FILE } from '../consts';
-import { assertSafeWorkspacePath, isFileNotFoundError, normalizeProjectPath } from './pathSafety';
+import {
+    assertSafeWorkspacePath,
+    getWorkspaceRelativePath,
+    isFileNotFoundError,
+    normalizeProjectPath,
+} from './pathSafety';
 import { isSupportedServerUrl, validateServerUrl } from './serverUrl';
 
 /**
@@ -326,12 +331,7 @@ export class SettingsManager {
     getFilePath(relativePath: string): vscode.Uri {
         const canonicalPath = normalizeProjectPath(relativePath, false);
         const candidate = vscode.Uri.joinPath(this.workspaceFolder, canonicalPath.slice(1));
-        const workspacePath = this.workspaceFolder.path.replace(/\/+$/, '');
-        const candidatePath = candidate.path.replace(/\/+$/, '');
-        const isContained = candidate.scheme === this.workspaceFolder.scheme
-            && candidate.authority === this.workspaceFolder.authority
-            && candidatePath.startsWith(`${workspacePath}/`);
-        if (!isContained) {
+        if (getWorkspaceRelativePath(this.workspaceFolder, candidate) === undefined) {
             throw new Error(`Refusing to access a path outside the LocalLeaf workspace: ${relativePath}`);
         }
         return candidate;
@@ -341,13 +341,10 @@ export class SettingsManager {
      * Convert an absolute URI to a relative path
      */
     getRelativePath(uri: vscode.Uri): string | undefined {
-        if (uri.scheme !== this.workspaceFolder.scheme || uri.authority !== this.workspaceFolder.authority) {
-            return undefined;
-        }
-        const workspacePath = this.workspaceFolder.path.replace(/\/+$/, '');
-        if (uri.path === workspacePath) return '/';
-        if (!uri.path.startsWith(`${workspacePath}/`)) return undefined;
-        return normalizeProjectPath(uri.path.slice(workspacePath.length));
+        const relativePath = getWorkspaceRelativePath(this.workspaceFolder, uri);
+        if (relativePath === undefined) return undefined;
+        if (relativePath === '') return '/';
+        return normalizeProjectPath(`/${relativePath}`);
     }
 
     /**
