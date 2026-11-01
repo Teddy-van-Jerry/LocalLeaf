@@ -90,6 +90,7 @@ export class IgnoreParser {
     shouldIgnore(relativePath: string): boolean {
         // Normalize path (ensure it starts with /)
         const normalizedPath = relativePath.startsWith('/') ? relativePath : '/' + relativePath;
+        if (/^\/(?:\.localleaf|\.git)(?:\/|$)/.test(normalizedPath) || normalizedPath === '/.leafignore') return true;
 
         for (const pattern of this.resolvedPatterns) {
             // Handle patterns that start with / (anchored to root)
@@ -102,6 +103,15 @@ export class IgnoreParser {
             // Also try matching without leading slash
             if (minimatch(normalizedPath.slice(1), pattern, { dot: true })) {
                 return true;
+            }
+            // Ignoring a directory also ignores children when a watcher sends
+            // an event directly for a nested file (without visiting its parent).
+            const segments = normalizedPath.slice(1).split('/');
+            for (let i = 1; i < segments.length; i++) {
+                const parent = segments.slice(0, i).join('/');
+                if ([parent, parent + '/'].some(candidate =>
+                    minimatch('/' + candidate, patternToMatch, {dot: true}) ||
+                    minimatch(candidate, pattern, {dot: true}))) return true;
             }
         }
 

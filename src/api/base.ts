@@ -5,7 +5,13 @@
 
 import * as http from 'http';
 import * as https from 'https';
-import * as stream from 'stream';
+import fetchImpl, { RequestInfo, RequestInit } from 'node-fetch';
+
+// Bound both response and body waits so a dropped connection cannot hold the
+// extension's serialized command queue indefinitely (node-fetch v2).
+function fetch(url: RequestInfo, options: RequestInit = {}) {
+    return fetchImpl(url, { ...options, timeout: 30000 });
+}
 import { Identity } from '../utils/credentialManager';
 
 export interface ProjectInfo {
@@ -57,6 +63,28 @@ export interface ResponseSchema {
     folder?: FileEntity;
 }
 
+interface ProjectPageQueue {
+    tail: Promise<void>;
+    nextRequestAt: number;
+}
+
+// Project pages are expensive and rate limited separately from document edits.
+// Share the schedule across API instances so reconnects cannot reset a cooldown.
+const projectPageQueues = new Map<string, ProjectPageQueue>();
+const PROJECT_PAGE_INTERVAL_MS = 5000;
+const PROJECT_PAGE_RETRY_BUDGET_MS = 120000;
+
+function retryAfterMilliseconds(value: string | null): number | undefined {
+    if (!value?.trim()) return undefined;
+    if (/^\d+$/.test(value.trim())) {
+        const delay = Number(value) * 1000;
+        return Number.isFinite(delay) ? delay : undefined;
+    }
+    if (!/[a-z]/i.test(value)) return undefined;
+    const date = Date.parse(value);
+    return Number.isFinite(date) ? Math.max(0, date - Date.now()) : undefined;
+}
+
 export class BaseAPI {
     private url: string;
     private agent: http.Agent | https.Agent;
@@ -73,7 +101,6 @@ export class BaseAPI {
      * Get CSRF token from login page
      */
     private async getCsrfToken(): Promise<Identity> {
-        const fetch = (await import('node-fetch')).default;
         const res = await fetch(this.url + 'login', {
             method: 'GET',
             redirect: 'manual',
@@ -94,7 +121,6 @@ export class BaseAPI {
      * Get user ID from project page (validates cookies)
      */
     private async getUserId(cookies: string): Promise<{ userId: string; userEmail: string; csrfToken: string } | undefined> {
-        const fetch = (await import('node-fetch')).default;
         const res = await fetch(this.url + 'project', {
             method: 'GET',
             redirect: 'manual',
@@ -124,7 +150,6 @@ export class BaseAPI {
      * Update cookies with socket.io session
      */
     async updateCookies(identity: Identity): Promise<Identity> {
-        const fetch = (await import('node-fetch')).default;
         const res = await fetch(this.url + 'socket.io/socket.io.js', {
             method: 'GET',
             redirect: 'manual',
@@ -168,7 +193,6 @@ export class BaseAPI {
      * Login with email and password (not available for www.overleaf.com due to SSO/captcha)
      */
     async passportLogin(email: string, password: string): Promise<ResponseSchema> {
-        const fetch = (await import('node-fetch')).default;
         const identity = await this.getCsrfToken();
         const res = await fetch(this.url + 'login', {
             method: 'POST',
@@ -251,7 +275,6 @@ export class BaseAPI {
             return { type: 'error', message: 'Not authenticated' };
         }
 
-        const fetch = (await import('node-fetch')).default;
         const headers: Record<string, string> = {
             'Connection': 'keep-alive',
             'Cookie': this.identity.cookies,
@@ -288,36 +311,30 @@ export class BaseAPI {
     /**
      * Download file content
      */
-    private async download(route: string): Promise<Buffer> {
+    private async download(route: string): Promise<ResponseSchema> {
         if (!this.identity) {
             throw new Error('Not authenticated');
         }
 
-        const fetch = (await import('node-fetch')).default;
-        const content: Buffer[] = [];
-
-        while (true) {
-            const res = await fetch(this.url + route, {
-                method: 'GET',
-                redirect: 'manual',
-                agent: this.agent,
-                headers: {
-                    'Connection': 'keep-alive',
-                    'Cookie': this.identity.cookies,
-                },
-            });
-
-            if (res.status === 200) {
-                content.push(await res.buffer());
-                break;
-            } else if (res.status === 206) {
-                content.push(await res.buffer());
-            } else {
-                break;
-            }
+        const res = await fetch(this.url + route, {
+            method: 'GET',
+            redirect: 'manual',
+            agent: this.agent,
+            headers: {
+                'Connection': 'keep-alive',
+                'Cookie': this.identity.cookies,
+            },
+        });
+        if (res.status === 200) {
+            return { type: 'success', content: new Uint8Array(await res.buffer()) };
         }
-
-        return Buffer.concat(content);
+        await res.text();
+        if (res.status === 401 || res.status === 403) {
+            return { type: 'error', message: 'Session expired', authError: 'session_expired' };
+        }
+        // No Range was requested. A partial response cannot be safely appended
+        // by repeating the same GET, and errors must never become empty files.
+        return { type: 'error', message: `${res.status}: Failed to download complete file` };
     }
 
     /**
@@ -335,7 +352,6 @@ export class BaseAPI {
             return { type: 'error', message: 'Not authenticated' };
         }
 
-        const fetch = (await import('node-fetch')).default;
         const res = await fetch(this.url + 'user/projects', {
             method: 'GET',
             redirect: 'manual',
@@ -368,8 +384,7 @@ export class BaseAPI {
      * Get file content
      */
     async getFile(projectId: string, fileId: string): Promise<ResponseSchema> {
-        const content = await this.download(`project/${projectId}/file/${fileId}`);
-        return { type: 'success', content: new Uint8Array(content) };
+        return this.download(`project/${projectId}/file/${fileId}`);
     }
 
     /**
@@ -386,17 +401,15 @@ export class BaseAPI {
         }
 
         const FormData = require('form-data');
-        const fetch = (await import('node-fetch')).default;
         const mimeTypes = require('mime-types');
 
-        const fileStream = stream.Readable.from(fileContent);
         const formData = new FormData();
         const mimeType = mimeTypes.lookup(filename);
 
         formData.append('targetFolderId', parentFolderId);
         formData.append('name', filename);
         formData.append('type', mimeType || 'text/plain');
-        formData.append('qqfile', fileStream, { filename });
+        formData.append('qqfile', Buffer.from(fileContent), { filename, contentType: mimeType || 'application/octet-stream' });
 
         const res = await fetch(
             this.url + `project/${projectId}/upload?folder_id=${parentFolderId}`,
@@ -419,6 +432,9 @@ export class BaseAPI {
                 uploadData = await res.json();
             } catch {
                 // Some Overleaf versions return an empty successful response.
+            }
+            if (uploadData?.success === false || uploadData?.error) {
+                return { type: 'error', message: String(uploadData.error || 'Overleaf rejected the upload') };
             }
 
             const rawEntity = uploadData?.file || uploadData?.entity || uploadData;
@@ -450,7 +466,6 @@ export class BaseAPI {
             return { type: 'error', message: 'Not authenticated' };
         }
 
-        const fetch = (await import('node-fetch')).default;
         const res = await fetch(this.url + `project/${projectId}/doc`, {
             method: 'POST',
             redirect: 'manual',
@@ -502,7 +517,6 @@ export class BaseAPI {
             return { type: 'error', message: 'Not authenticated' };
         }
 
-        const fetch = (await import('node-fetch')).default;
         const res = await fetch(this.url + `project/${projectId}/folder`, {
             method: 'POST',
             redirect: 'manual',
@@ -556,7 +570,6 @@ export class BaseAPI {
             return { type: 'error', message: 'Not authenticated' };
         }
 
-        const fetch = (await import('node-fetch')).default;
         const res = await fetch(this.url + `project/${projectId}/${entityType}/${entityId}/rename`, {
             method: 'POST',
             redirect: 'manual',
@@ -595,7 +608,6 @@ export class BaseAPI {
             return { type: 'error', message: 'Not authenticated' };
         }
 
-        const fetch = (await import('node-fetch')).default;
         const res = await fetch(this.url + `project/${projectId}/${entityType}/${entityId}/move`, {
             method: 'POST',
             redirect: 'manual',
@@ -632,12 +644,63 @@ export class BaseAPI {
      * Get project details via HTTP (alternative to socket.io joinProject)
      * Fetches project page and extracts metadata from HTML
      */
-    async getProjectDetails(projectId: string): Promise<ResponseSchema & { projectData?: any }> {
+    async getProjectDetails(
+        projectId: string,
+        onWait?: (delayMs: number, rateLimited: boolean) => void
+    ): Promise<ResponseSchema & { projectData?: any }> {
+        let queue = projectPageQueues.get(this.url);
+        if (!queue) {
+            queue = { tail: Promise.resolve(), nextRequestAt: 0 };
+            projectPageQueues.set(this.url, queue);
+        }
+        const schedule = queue;
+        // Serialize reads, but do not cache snapshots: callers also refresh after
+        // mutations and immediately before overwriting selected remote files.
+        const pending = schedule.tail.then(async () => {
+            const deadline = Date.now() + PROJECT_PAGE_RETRY_BUDGET_MS;
+            let rateLimited = false;
+            for (let attempt = 0; ; attempt++) {
+                const delay = Math.max(0, schedule.nextRequestAt - Date.now());
+                if (delay > 0) {
+                    if (Date.now() + delay > deadline) {
+                        return this.projectPageRateLimitError(delay);
+                    }
+                    onWait?.(delay, rateLimited);
+                    await new Promise<void>(resolve => setTimeout(resolve, delay));
+                }
+                schedule.nextRequestAt = Date.now() + PROJECT_PAGE_INTERVAL_MS;
+                const result = await this.fetchProjectDetails(projectId);
+                if (result.statusCode !== 429) return result;
+
+                rateLimited = true;
+                const retryDelay = Math.max(PROJECT_PAGE_INTERVAL_MS,
+                    result.retryAfterMs ?? 30000 * (2 ** attempt));
+                schedule.nextRequestAt = Date.now() + retryDelay;
+                if (attempt >= 2 || schedule.nextRequestAt > deadline) {
+                    return this.projectPageRateLimitError(retryDelay);
+                }
+            }
+        });
+        // Failed HTTP reads must not poison the queue for later manual retries.
+        schedule.tail = pending.then(() => undefined, () => undefined);
+        return pending;
+    }
+
+    private projectPageRateLimitError(delayMs: number): ResponseSchema {
+        return {
+            type: 'error',
+            message: `Overleaf is limiting project refreshes (HTTP 429). ` +
+                `Please try again in ${Math.ceil(delayMs / 1000)} seconds.`,
+        };
+    }
+
+    private async fetchProjectDetails(projectId: string): Promise<ResponseSchema & {
+        projectData?: any; statusCode?: number; retryAfterMs?: number;
+    }> {
         if (!this.identity) {
             return { type: 'error', message: 'Not authenticated' };
         }
 
-        const fetch = (await import('node-fetch')).default;
 
         // Get project page which contains metadata in HTML
         const res = await fetch(this.url + `project/${projectId}`, {
@@ -687,7 +750,15 @@ export class BaseAPI {
         if (res.status === 403 || res.status === 401) {
             return { type: 'error', message: 'Session expired', authError: 'session_expired' };
         }
-        return { type: 'error', message: `${res.status}: Failed to get project details` };
+        // Consume error responses so keep-alive connections can be reused.
+        await res.text();
+        return {
+            type: 'error',
+            message: `${res.status}: Failed to get project details`,
+            statusCode: res.status,
+            retryAfterMs: res.status === 429
+                ? retryAfterMilliseconds(res.headers.get('retry-after')) : undefined,
+        };
     }
 
     /**
@@ -698,7 +769,6 @@ export class BaseAPI {
             return { type: 'error', message: 'Not authenticated' };
         }
 
-        const fetch = (await import('node-fetch')).default;
         const res = await fetch(this.url + `project/${projectId}/entities`, {
             method: 'GET',
             redirect: 'manual',
@@ -728,7 +798,6 @@ export class BaseAPI {
             return { type: 'error', message: 'Not authenticated' };
         }
 
-        const fetch = (await import('node-fetch')).default;
         const res = await fetch(this.url + `project/${projectId}/doc/${docId}`, {
             method: 'GET',
             redirect: 'manual',

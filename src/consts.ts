@@ -57,6 +57,8 @@ export const COMMANDS = {
     LOGIN: 'localleaf.login',
     LOGOUT: 'localleaf.logout',
     LINK_FOLDER: 'localleaf.linkFolder',
+    SELECT_SYNC_FOLDER: 'localleaf.selectSyncFolder',
+    USE_WORKSPACE_FOLDER: 'localleaf.useWorkspaceFolder',
     UNLINK_FOLDER: 'localleaf.unlinkFolder',
     SYNC_NOW: 'localleaf.syncNow',
     PULL_FROM_OVERLEAF: 'localleaf.pullFromOverleaf',

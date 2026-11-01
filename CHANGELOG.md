@@ -2,6 +2,35 @@
 
 All notable changes to LocalLeaf will be documented in this file.
 
+## [0.1.10] - 2026-10-19 (local build)
+
+### Fixed
+
+- Reject failed and partial downloads instead of treating HTTP errors as empty files, and preserve exact binary bytes in multipart uploads.
+- Separate acceptance of new remote files from overwrite decisions for existing conflicts. Recheck local contents after prompts and preserve unsaved editor changes.
+- Refresh trees before pulling, retain document subscriptions, and defer watcher echoes during manual synchronization.
+- Record new-file synchronization only after upload succeeds, so failed writes cannot make empty creation acknowledgements overwrite local manuscripts.
+- Read current document snapshots for remote notifications so delayed, duplicated, or busy-path events cannot apply stale text offsets.
+- Preserve edited and untracked local files during remote deletion or relocation, update folder descendants together, and verify remote contents before propagating local deletion.
+- Compare exact bytes when suppressing echoes, inherit ignored-directory rules for nested watcher events, and reject unsafe paths and writes through symbolic links.
+- Add real HTTP upload/download tests and synchronization regressions covering conflicts, deletion, relocation, watcher races, and failure propagation.
+
+## [0.1.9] - 2026-10-19 (local build)
+
+### Fixed
+
+- Read current file trees from a fresh protocol-v2 socket join. Modern Overleaf editor HTML does not contain `ol-rootFolder`.
+- Keep the editing connection and document subscriptions open while obtaining and closing the temporary snapshot connection.
+- Serialize and space snapshot requests, and preserve fresh checks before manual uploads.
+
+## [0.1.8] - 2026-10-19 (local build)
+
+### Fixed
+
+- Space and serialize project page requests, including across reconnects.
+- Recover from HTTP 429 with bounded retries, honoring `Retry-After` and showing the wait in sync status.
+- Keep fresh file-tree reads before manual uploads and preserve the existing tree when refresh fails.
+
 ## [0.1.3] - 2026-01-04
 
 ### Added
