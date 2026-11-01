@@ -11,6 +11,13 @@ export async function testSyncFolders(): Promise<void> {
         _load: (request: string, parent: unknown, isMain: boolean) => unknown;
     };
     const originalLoad = Module._load;
+    const waitFor = async (predicate: () => boolean) => {
+        for (let i = 0; i < 200; i++) {
+            if (predicate()) return;
+            await new Promise(resolve => setTimeout(resolve, 5));
+        }
+        assert.fail('Expected background activation to finish');
+    };
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'localleaf-folders-'));
     const workspacePath = path.join(root, 'workspace');
     const externalPath = path.join(root, 'external');
@@ -62,7 +69,8 @@ export async function testSyncFolders(): Promise<void> {
         }
         onStatusChange(): void {}
         async connect(): Promise<void> {}
-        getSocket(): undefined { return undefined; }
+        getSocket(): { isConnected: boolean } { return { isConnected: true }; }
+        startLocalWatcher(): void {}
         async detectMainDocument(): Promise<void> {}
         async pullAll(): Promise<void> {
             const pull = nextPull;
@@ -148,6 +156,12 @@ export async function testSyncFolders(): Promise<void> {
                 return { type: 'success', projects: [{ id: 'external', name: 'External project' }] };
             }
         } };
+        if (request === './collaboration/cursorTracker') return { CursorTracker: class {
+            async initialize(): Promise<void> {}
+            dispose(): void {}
+            getOnlineUsers(): unknown[] { return []; }
+            getUserCount(): number { return 0; }
+        } };
         if (request === './api/socketio') return { setOutputChannel() {} };
         return originalLoad(request, parent, isMain);
     };
@@ -186,6 +200,7 @@ export async function testSyncFolders(): Promise<void> {
         extension = require('../extension') as typeof import('../extension');
         await extension.activate(context);
         assert.equal(engines.length, 0, 'selecting an unlinked folder does not create a connection');
+        await waitFor(() => watchers.length > 0);
         assert.equal(watchers[0].base.fsPath, externalPath);
         const engineModule = require.resolve('../sync/syncEngine');
         const cachedEngine = require.cache[engineModule];
@@ -195,11 +210,13 @@ export async function testSyncFolders(): Promise<void> {
         const localWatching = Object.create(SyncEngine.prototype) as {
             settings: { getWorkspaceFolder(): vscode.Uri };
             disposables: vscode.Disposable[];
-            setupLocalWatcher(): void;
+            socket: { isConnected: boolean };
+            startLocalWatcher(): void;
         };
         localWatching.settings = { getWorkspaceFolder: () => external };
         localWatching.disposables = [];
-        localWatching.setupLocalWatcher();
+        localWatching.socket = { isConnected: true };
+        localWatching.startLocalWatcher();
         assert.equal(watchers.at(-1)?.base.fsPath, externalPath, 'file events use the external sync root');
         localWatching.disposables.forEach(disposable => disposable.dispose());
         await commands.get('localleaf.linkFolder')!();
@@ -262,7 +279,7 @@ export async function testSyncFolders(): Promise<void> {
         await extension.activate(context);
         assert.equal(folders.getFolder()?.fsPath, externalPath, 'missing saved folder never falls back');
         assert.equal(watchers.filter(watcher => !watcher.disposed).length, 0);
-        assert.ok(warnings.some(message => message.includes('Cannot use the sync folder')));
+        await waitFor(() => warnings.some(message => message.includes('Cannot use the sync folder')));
         await commands.get('localleaf.useWorkspaceFolder')!();
         assert.equal(watchers.at(-1)?.base.fsPath, workspacePath, 'commands recover after a failed restore');
         console.log('LocalLeaf sync folder regression tests passed.');

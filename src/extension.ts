@@ -26,6 +26,7 @@ let credentialManager: CredentialManager;
 let syncEngine: SyncEngine | undefined;
 let cursorTracker: CursorTracker | undefined;
 let statusBarItem: vscode.StatusBarItem;
+let pushStatusBarItem: vscode.StatusBarItem;
 let loginStatusItem: vscode.StatusBarItem;
 let collaboratorStatusItem: vscode.StatusBarItem;
 let outputChannel: vscode.OutputChannel;
@@ -34,18 +35,60 @@ let authState: AuthState = 'none';
 let syncFolderManager: SyncFolderManager;
 let settingsWatcher: vscode.FileSystemWatcher | undefined;
 let commandTask: Promise<unknown> = Promise.resolve();
+let pendingCommands = 0;
+let reconnectTimer: NodeJS.Timeout | undefined;
+let reconnectAttempt = 0;
+let reconnectGeneration = 0;
+
+function cancelReconnect(resetAttempts = true): void {
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = undefined;
+    reconnectGeneration++;
+    if (resetAttempts) reconnectAttempt = 0;
+}
+
+function scheduleReconnect(settings: SettingsManager, engine: SyncEngine): void {
+    if (reconnectTimer || syncEngine !== engine) return;
+    const generation = reconnectGeneration;
+    const delay = Math.min(2000 * 2 ** Math.min(reconnectAttempt++, 5), 60000);
+    log(`Connection interrupted; reconnecting in ${delay / 1000}s`);
+    reconnectTimer = setTimeout(() => {
+        // Keep the timer marked pending until the serialized command starts.
+        void queueCommand(async () => {
+            if (generation !== reconnectGeneration || syncEngine !== engine) return;
+            reconnectTimer = undefined;
+            await initializeSync(settings, true);
+        });
+    }, delay);
+}
+
+function reportCommandError(error: unknown): void {
+    log(`Command failed: ${errorMessage(error)}`);
+    void vscode.window.showErrorMessage(`LocalLeaf: ${errorMessage(error)}`);
+}
+
+function queueCommand(handler: () => unknown): Promise<unknown> {
+    pendingCommands++;
+    commandTask = commandTask.then(handler).catch(reportCommandError).finally(() => {
+        pendingCommands--;
+    });
+    return commandTask;
+}
 
 function getSettingsManager(): SettingsManager | undefined {
     const folder = syncFolderManager.getFolder();
     return folder ? SettingsManager.getInstance(folder) : undefined;
 }
 
-function stopSync(): void {
+function stopSync(resetAttempts = true): void {
+    cancelReconnect(resetAttempts);
+    pushStatusBarItem?.hide();
     stopStatusUpdates();
     cursorTracker?.dispose();
     cursorTracker = undefined;
-    syncEngine?.disconnect();
+    const previousEngine = syncEngine;
     syncEngine = undefined;
+    previousEngine?.disconnect();
 }
 
 /** Restore only the chosen folder; a missing selection must not sync the workspace instead. */
@@ -105,6 +148,13 @@ export async function activate(context: vscode.ExtensionContext) {
     statusBarItem.name = `${EXTENSION_NAME} Sync`;
     context.subscriptions.push(statusBarItem);
 
+    pushStatusBarItem = vscode.window.createStatusBarItem('localleaf.pushToOverleaf', vscode.StatusBarAlignment.Left, STATUS_BAR_PRIORITY - 0.5);
+    pushStatusBarItem.name = `${EXTENSION_NAME} Push to Overleaf`;
+    pushStatusBarItem.text = '$(cloud-upload) Push to Overleaf';
+    pushStatusBarItem.tooltip = 'Choose saved local changes to upload to Overleaf';
+    pushStatusBarItem.command = COMMANDS.PUSH_TO_OVERLEAF;
+    context.subscriptions.push(pushStatusBarItem);
+
     // Login status (left side, before sync)
     loginStatusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, STATUS_BAR_PRIORITY + 1);
     loginStatusItem.name = `${EXTENSION_NAME} Login`;
@@ -117,11 +167,15 @@ export async function activate(context: vscode.ExtensionContext) {
     collaboratorStatusItem.command = COMMANDS.JUMP_TO_COLLABORATOR;
     context.subscriptions.push(collaboratorStatusItem);
 
-    await activateSyncFolder();
     context.subscriptions.push({ dispose: () => settingsWatcher?.dispose() });
     registerCommands(context);
 
     log('LocalLeaf activated');
+
+    // VS Code waits for activate() before dispatching commands. Do not keep it
+    // waiting on network requests or on a conflict notification in the initial pull.
+    // Queue restoration so folder changes still wait for the current sync to finish.
+    void queueCommand(activateSyncFolder);
 
     } catch (error) {
         console.error('[LocalLeaf] Activation error:', error);
@@ -134,14 +188,11 @@ export async function activate(context: vscode.ExtensionContext) {
  */
 function registerCommands(context: vscode.ExtensionContext) {
     // Finish an in-flight pull or reconnect before switching its destination folder.
-    const registerCommand = (command: string, handler: () => unknown) =>
+    const registerCommand = (command: string, handler: () => unknown, serialized = true) =>
         vscode.commands.registerCommand(command, () => {
-            const pending = commandTask.then(handler);
-            commandTask = pending.catch(error => {
-                log(`Command failed: ${errorMessage(error)}`);
-                vscode.window.showErrorMessage(`LocalLeaf: ${errorMessage(error)}`);
-            });
-            return commandTask;
+            return serialized
+                ? queueCommand(handler)
+                : Promise.resolve().then(handler).catch(reportCommandError);
         });
     context.subscriptions.push(
         registerCommand(COMMANDS.LOGIN, cmdLogin),
@@ -155,7 +206,7 @@ function registerCommands(context: vscode.ExtensionContext) {
         registerCommand(COMMANDS.PUSH_TO_OVERLEAF, cmdPushToOverleaf),
         registerCommand(COMMANDS.EDIT_IGNORE_PATTERNS, cmdEditIgnorePatterns),
         registerCommand(COMMANDS.CLEAN_IGNORED_REMOTE, cmdCleanIgnoredRemoteFiles),
-        registerCommand(COMMANDS.SHOW_SYNC_STATUS, cmdShowSyncStatus),
+        registerCommand(COMMANDS.SHOW_SYNC_STATUS, cmdShowSyncStatus, false),
         registerCommand(COMMANDS.SET_MAIN_DOCUMENT, cmdSetMainDocument),
         registerCommand(COMMANDS.CONFIGURE, cmdConfigure),
         registerCommand(COMMANDS.JUMP_TO_COLLABORATOR, cmdJumpToCollaborator),
@@ -167,13 +218,15 @@ function registerCommands(context: vscode.ExtensionContext) {
 /**
  * Initialize sync engine for linked folder
  */
-async function initializeSync(settings: SettingsManager): Promise<void> {
-    stopSync();
+async function initializeSync(settings: SettingsManager, automatic = false): Promise<void> {
+    stopSync(!automatic);
+    const generation = reconnectGeneration;
     const projectSettings = settings.getSettings();
     if (!projectSettings) return;
 
     // Get credentials
     const credential = await credentialManager.getCredential(projectSettings.serverUrl);
+    if (generation !== reconnectGeneration) return;
     if (!credential) {
         updateStatusBar('disconnected', 'Not logged in');
         vscode.window.showWarningMessage('LocalLeaf: Please login to Overleaf first');
@@ -185,27 +238,41 @@ async function initializeSync(settings: SettingsManager): Promise<void> {
     api.setIdentity(credential.identity);
 
     // Create sync engine
-    syncEngine = new SyncEngine(api, settings, log);
+    const engine = new SyncEngine(api, settings, log);
+    syncEngine = engine;
+    let authExpired = false;
 
     // Listen to status changes
-    syncEngine.onStatusChange(async event => {
+    engine.onStatusChange(async event => {
+        if (syncEngine !== engine || authExpired) return;
         updateStatusBar(event.status, event.message);
         // Handle auth errors
         if (event.authError) {
+            authExpired = true;
+            cancelReconnect();
             await setAuthState('expired');
             showSessionExpiredNotification();
+        } else if (event.status === 'disconnected') {
+            scheduleReconnect(settings, engine);
         }
     });
 
     // Connect
     try {
-        await syncEngine.connect();
+        await engine.connect();
+        if (syncEngine !== engine || authExpired) return;
+        if (!engine.getSocket()?.isConnected) {
+            updateStatusBar('disconnected', 'Real-time connection unavailable; retrying');
+            scheduleReconnect(settings, engine);
+            return;
+        }
 
         // Initialize cursor tracker
-        const socket = syncEngine.getSocket();
+        const socket = engine.getSocket();
         if (socket) {
             cursorTracker = new CursorTracker(socket, settings);
             await cursorTracker.initialize();
+            if (syncEngine !== engine) return;
         }
 
         // Start periodic status updates for collaborators
@@ -214,26 +281,35 @@ async function initializeSync(settings: SettingsManager): Promise<void> {
         log('Sync engine connected');
 
         // Auto-detect main document from project settings
-        await syncEngine.detectMainDocument();
+        await engine.detectMainDocument();
+        if (syncEngine !== engine) return;
 
         // Auto-pull on project load
         try {
             log('Auto-pulling files from Overleaf...');
-            await syncEngine.pullAll();
+            await engine.pullAll();
+            if (syncEngine !== engine) return;
             log('Auto-pull complete');
 
             // Join all docs to receive real-time OT updates
-            await syncEngine.joinAllDocsForWatching();
+            await engine.joinAllDocsForWatching();
+            if (syncEngine !== engine || authExpired || !engine.getSocket()?.isConnected) {
+                if (!authExpired) scheduleReconnect(settings, engine);
+                return;
+            }
+            engine.startLocalWatcher();
+            cancelReconnect();
             log('Watching for remote changes');
 
-            vscode.window.showInformationMessage(`LocalLeaf: Synced with "${projectSettings.projectName}"`);
+            if (!automatic) vscode.window.showInformationMessage(`LocalLeaf: Synced with "${projectSettings.projectName}"`);
         } catch (pullError) {
             log(`Auto-pull failed: ${pullError}`);
-            // Don't show error for auto-pull, user can manually pull
+            if (!authExpired) scheduleReconnect(settings, engine);
         }
     } catch (error) {
         log(`Failed to connect: ${error}`);
-        vscode.window.showErrorMessage(`LocalLeaf: Failed to connect - ${error}`);
+        if (!authExpired) scheduleReconnect(settings, engine);
+        if (!automatic && !authExpired) vscode.window.showErrorMessage(`LocalLeaf: Failed to connect - ${error}`);
     }
 }
 
@@ -263,6 +339,15 @@ function updateStatusBar(status: SyncStatus, message?: string) {
     }
 
     statusBarItem.show();
+    if (syncEngine) {
+        pushStatusBarItem.text = `${status === 'pushing' ? '$(sync~spin)' : '$(cloud-upload)'} Push to Overleaf`;
+        pushStatusBarItem.tooltip = syncEngine.getSocket()?.isConnected
+            ? 'Choose saved local changes to upload to Overleaf'
+            : 'Reconnect to Overleaf before uploading';
+        pushStatusBarItem.show();
+    } else {
+        pushStatusBarItem.hide();
+    }
 
     // Update collaborator status bar based on connection
     if (status === 'disconnected' || status === 'error') {
@@ -348,7 +433,7 @@ async function showSessionExpiredNotification(): Promise<void> {
     );
 
     if (action === 'Refresh Cookie') {
-        await cmdRefreshCookie();
+        await queueCommand(cmdRefreshCookie);
     }
 }
 
@@ -730,7 +815,28 @@ async function cmdPushToOverleaf() {
         return;
     }
 
-    vscode.window.showInformationMessage('LocalLeaf: Push is automatic via real-time sync');
+    const engine = syncEngine;
+    if (!engine.getSocket()?.isConnected) {
+        vscode.window.showWarningMessage('LocalLeaf: Reconnect to Overleaf before pushing. Use LocalLeaf: Show Sync Status.');
+        return;
+    }
+    try {
+        const result = await vscode.window.withProgress({
+            location: vscode.ProgressLocation.Notification,
+            title: 'LocalLeaf: Preparing and uploading local changes...',
+            cancellable: false,
+        }, () => engine.pushAll());
+        if (result.cancelled) return;
+        if (result.failed.length) {
+            vscode.window.showErrorMessage(`LocalLeaf: ${result.uploaded} uploaded, ${result.failed.length} failed. ${result.failed[0]}`);
+        } else {
+            vscode.window.showInformationMessage(result.uploaded
+                ? `LocalLeaf: Pushed ${result.uploaded} file(s) to Overleaf.`
+                : 'LocalLeaf: Saved files already match Overleaf.');
+        }
+    } catch (error) {
+        vscode.window.showErrorMessage(`LocalLeaf: Push failed - ${errorMessage(error)}`);
+    }
 }
 
 /**
@@ -851,12 +957,27 @@ async function cmdShowSyncStatus() {
         }
     } else {
         items.push({
-            label: '$(info) Not linked',
-            description: 'Use "LocalLeaf: Link Folder" to connect to Overleaf',
+            label: pendingCommands > 0 ? '$(sync~spin) Initializing' : '$(info) Not linked',
+            description: pendingCommands > 0
+                ? 'Restoring the selected sync folder'
+                : 'Use "LocalLeaf: Link Folder" to connect to Overleaf',
+        });
+    }
+
+    if (pendingCommands > 0) {
+        items.push({
+            label: '$(sync~spin) Sync operation in progress',
+            description: 'Check pending conflict notifications',
+            detail: 'Other sync operations wait for this operation. If it remains stuck, run Developer: Reload Window.',
         });
     }
 
     items.push({ label: '', kind: vscode.QuickPickItemKind.Separator });
+    items.push({ label: '$(output) Show LocalLeaf Output', description: 'View connection and sync logs' });
+
+    if (settings && syncEngine?.getSocket()?.isConnected) {
+        items.push({label: '$(cloud-upload) Push local changes to Overleaf', description: 'Choose files to upload'});
+    }
 
     // Show resync option when there's an error or when connected
     if (settings && (currentStatus === 'error' || currentStatus === 'idle')) {
@@ -908,18 +1029,31 @@ async function cmdShowSyncStatus() {
         title: 'LocalLeaf Status',
     });
 
-    if (selected?.label.includes('Resync')) {
-        await cmdPullFromOverleaf();
+    // Status is available during a sync; actions chosen from it must still use
+    // the same queue as other mutations to avoid changing destinations mid-pull.
+    const scheduleAction = (handler: () => unknown) => {
+        if (pendingCommands > 0) {
+            void vscode.window.showInformationMessage('LocalLeaf: This action is queued behind the current sync. Check pending conflict notifications, or use Developer: Reload Window if the sync is stuck.');
+        }
+        return queueCommand(handler);
+    };
+
+    if (selected?.label.includes('Show LocalLeaf Output')) {
+        outputChannel.show();
+    } else if (selected?.label.includes('Push local changes')) {
+        await scheduleAction(cmdPushToOverleaf);
+    } else if (selected?.label.includes('Resync')) {
+        await scheduleAction(cmdPullFromOverleaf);
     } else if (selected?.label.includes('Reconnect')) {
-        await cmdReconnect();
+        await scheduleAction(cmdReconnect);
     } else if (selected?.label.includes('Refresh Cookie')) {
-        await cmdRefreshCookie();
+        await scheduleAction(cmdRefreshCookie);
     } else if (selected?.label.includes('Verify Credentials')) {
-        await cmdVerifyCredentials();
+        await scheduleAction(cmdVerifyCredentials);
     } else if (selected?.label.includes('Jump to collaborator')) {
         await cursorTracker?.jumpToUser();
     } else if (selected?.label.includes('Unlink folder')) {
-        await cmdUnlinkFolder();
+        await scheduleAction(cmdUnlinkFolder);
     }
 }
 

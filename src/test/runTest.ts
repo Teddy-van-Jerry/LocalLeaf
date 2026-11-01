@@ -33,7 +33,7 @@ Module._load = function (request: string, parent: unknown, isMain: boolean): unk
             EventEmitter: MockEventEmitter,
             FileSystemError: MockFileSystemError,
             FileType: { File: 1, Directory: 2 },
-            workspace: { fs: {} },
+            workspace: { fs: {}, getConfiguration: () => ({ get: () => true }) },
         };
     }
     if (request === '../api/socketio') {
@@ -123,8 +123,8 @@ async function run(): Promise<void> {
     );
     assert.equal(
         propagation.shouldPropagate('push', '/chapter.tex', Uint8Array.from([2])),
-        false,
-        'identical content should still be treated as an echo'
+        true,
+        'unacknowledged content must remain eligible for retry'
     );
 
     const textCreation = Object.create(SyncEngine.prototype) as any;
@@ -137,7 +137,7 @@ async function run(): Promise<void> {
     textCreation.fileTree = new Map();
     textCreation.fileTreeByPath = new Map();
     textCreation.baseContent = new Map();
-    textCreation.socket = {};
+    textCreation.socket = { isConnected: true };
     let pushedDocument: { id: string; path: string; content: Uint8Array } | undefined;
     textCreation.pushDocumentChanges = async (
         id: string,
@@ -163,6 +163,7 @@ async function run(): Promise<void> {
     });
 
     const binaryReplacement = Object.create(SyncEngine.prototype) as any;
+    binaryReplacement.socket = { isConnected: true };
     binaryReplacement.settings = {
         getSettings: () => ({ projectId: 'project' }),
     };
@@ -222,6 +223,7 @@ async function run(): Promise<void> {
     ]);
 
     const failedReplacement = Object.create(SyncEngine.prototype) as any;
+    failedReplacement.socket = { isConnected: true };
     failedReplacement.settings = {
         getSettings: () => ({ projectId: 'project' }),
     };
@@ -266,10 +268,12 @@ async function run(): Promise<void> {
     );
 
     const acknowledgement = Object.create(SyncEngine.prototype) as any;
+    acknowledgement.socket = { isConnected: true };
     acknowledgement.fileTree = new Map([
         ['root', { id: 'root', type: 'folder', path: '/' }],
     ]);
     acknowledgement.fileTreeByPath = new Map();
+    acknowledgement.pendingRemoteStructure = new Set();
     acknowledgement.shouldSync = () => true;
     acknowledgement.acquireLock = () => false;
     const originalSetTimeout = global.setTimeout;
@@ -288,6 +292,8 @@ async function run(): Promise<void> {
     assert.equal(retryScheduled, true);
 
     const localCreate = Object.create(SyncEngine.prototype) as any;
+    localCreate.socket = { isConnected: true };
+    localCreate.settings = { getSettings: () => ({}), getWorkspaceFolder: () => ({}) };
     localCreate.getRelativePath = () => '/new.tex';
     localCreate.shouldSync = () => true;
     localCreate.acquireLock = () => false;

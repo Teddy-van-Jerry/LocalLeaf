@@ -68,15 +68,27 @@ other machines. VS Code must remain running in a trusted window for synchronizat
 | `LocalLeaf: Select Sync Folder` | Select and remember a sync folder independently of the workspace |
 | `LocalLeaf: Use Workspace Folder for Sync` | Clear the selection and sync the first workspace folder |
 | `LocalLeaf: Unlink Folder` | Disconnect folder from Overleaf project |
-| `LocalLeaf: Sync Now` | Manually trigger two-way sync |
+| `LocalLeaf: Sync Now` | Pull remote changes and resolve differences |
 | `LocalLeaf: Pull from Overleaf` | Download changes from Overleaf |
-| `LocalLeaf: Push to Overleaf` | Upload local changes to Overleaf |
+| `LocalLeaf: Push to Overleaf` | Review and upload selected saved local changes |
 | `LocalLeaf: Show Sync Status` | Display sync status and options to resync/reconnect |
 | `LocalLeaf: Edit Ignore Patterns` | Configure files to exclude from sync |
 | `LocalLeaf: Clean Ignored Files from Overleaf` | Delete stale remote files matched by `.leafignore`, after confirmation |
 | `LocalLeaf: Set Main Document` | Set the main `.tex` file for compilation |
 | `LocalLeaf: Configure Settings` | Open extension settings |
 | `LocalLeaf: Jump to Collaborator` | Navigate to a collaborator's cursor position |
+
+### Uploading manually
+
+Save your files, connect to Overleaf, and run **LocalLeaf: Push to Overleaf** from the Command Palette, click **Push to Overleaf** in the status bar, or choose **Push local changes to Overleaf** in the sync status menu. Select the changed files to upload and press Enter. Existing selected files are updated with local contents; new files are created. Files excluded by `.leafignore` are skipped, and remote-only files are not deleted.
+
+If a file changes while the selection is open, review it and run the command again. The result reports uploaded and failed files; failures remain eligible for retry.
+
+Project file-tree refreshes use a temporary real-time connection to read a fresh snapshot, since modern Overleaf editor HTML does not include the tree. The editing connection stays open. Snapshot requests are spaced at least five seconds apart, and the tree is read again after file selection so remote replacements are still detected before uploading. HTTP fallback requests retain bounded HTTP 429 retries and respect `Retry-After`.
+
+To control when uploads happen, disable **Localleaf: Auto Sync** in VS Code settings (`localleaf.autoSync: false`). A project's `.localleaf/settings.json` setting `autoSync: false` also disables automatic uploads. Manual push remains available with either setting disabled.
+
+Pull checks the current remote tree and asks how to resolve differing files. **Download All New** applies only to new files; existing conflicts require a separate decision. Unsaved edits and files changed while a prompt is open stop the affected operation. Remote deletion or relocation preserves locally edited and untracked files, with details in the LocalLeaf output panel.
 
 ## Settings
 

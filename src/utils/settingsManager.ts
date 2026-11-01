@@ -166,6 +166,10 @@ export class SettingsManager {
      * Get the path to a relative file in the workspace
      */
     getFilePath(relativePath: string): vscode.Uri {
+        if (relativePath.includes('\\') || relativePath.includes('\0') ||
+            relativePath.split('/').some(segment => segment === '..' || segment === '.')) {
+            throw new Error('Invalid path outside the sync folder');
+        }
         return vscode.Uri.joinPath(this.workspaceFolder, relativePath);
     }
 
@@ -174,7 +178,8 @@ export class SettingsManager {
      */
     getRelativePath(uri: vscode.Uri): string | undefined {
         const workspacePath = this.workspaceFolder.path;
-        if (uri.path.startsWith(workspacePath)) {
+        if (uri.scheme === this.workspaceFolder.scheme &&
+            (uri.path === workspacePath || uri.path.startsWith(workspacePath.replace(/\/$/, '') + '/'))) {
             return uri.path.slice(workspacePath.length);
         }
         return undefined;

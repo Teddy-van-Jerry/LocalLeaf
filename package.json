@@ -2,7 +2,7 @@
   "name": "localleaf",
   "displayName": "LocalLeaf",
   "description": "Local LaTeX Editing yet Synced to Overleaf",
-  "version": "0.1.3",
+  "version": "0.1.10",
   "publisher": "teddy-van-jerry",
   "repository": {
     "type": "git",
@@ -122,6 +122,8 @@
     }
   },
   "scripts": {
+    "test:reliability": "npm run compile && node out/test/runTest.js && node tests/activation-responsiveness.cjs && node tests/connection-reliability.cjs && node tests/manual-push.cjs && node tests/project-refresh.cjs && node tests/project-snapshot.cjs && node tests/api-integrity.cjs && node tests/data-safety.cjs",
+    "test:responsiveness": "npm run compile && node tests/activation-responsiveness.cjs",
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",

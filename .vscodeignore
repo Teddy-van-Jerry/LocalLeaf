@@ -3,6 +3,7 @@
 .github/**
 docs/**
 src/**
+tests/**
 patches/**
 dist/**
 images/*.svg
